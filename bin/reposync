@@ -4,6 +4,7 @@
 set -u
 
 export GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_MERGE_AUTOEDIT=no
+export GIT_OPTIONAL_LOCKS=0  # `git status` must not refresh (rewrite) the index of a repo the user is working in
 [ -n "${GIT_SSH_COMMAND:-}" ] || export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30'
 
 # run-level state
@@ -15,7 +16,7 @@ elif command -v gtimeout >/dev/null 2>&1; then TO=gtimeout; fi
 CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 HAVE_LOCK=0 CHILD="" RC=0 FAILED=0 IN_REPO=0 FROM_SIGNAL=0
 # per-repo state (see reset_repo_state)
-REPO_DIR="" REPO_NAME="" B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
+REPO_DIR="" REPO_NAME="" B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0 CLAUDE_MOVED=0
 SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT="" KSTATE="" KOLD=""
 TMPD=$(mktemp -d) || { echo "reposync: cannot create temp dir" >&2; exit 2; }
 OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err
@@ -118,7 +119,7 @@ git_net() {
 }
 
 reset_repo_state() {
-  B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
+  B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0 CLAUDE_MOVED=0
   SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT="" KSTATE="" KOLD=""
 }
 
@@ -160,6 +161,24 @@ gpath() {
   p=$(g rev-parse --git-path "$1" 2>/dev/null) || return 1
   case $p in /*) ;; *) p=$REPO_DIR/$p ;; esac
   printf '%s\n' "$p"
+}
+
+# on_pre: HEAD is still branch B at PRE (nobody moved it since reposync last looked).
+on_pre() { [ "$(g symbolic-ref -q HEAD)" = "refs/heads/$B" ] && [ "$(g rev-parse -q --verify HEAD)" = "$PRE" ]; }
+
+# foreign_head: HEAD is off B, or B is at a commit reposync did not put there (PRE; RS after a fast-forward; the
+# merge of PRE and RS; in commit mode the auto-commit on PRE). Then the user moved it during the run: hands off.
+foreign_head() {
+  local h
+  [ "$(g symbolic-ref -q HEAD)" = "refs/heads/$B" ] || return 0
+  h=$(g rev-parse -q --verify HEAD)
+  [ "$h" = "$PRE" ] && return 1
+  [ "$STATE" = behind ] && [ "$h" = "$RS" ] && return 1
+  case $(g rev-list --parents -n1 HEAD) in
+    "$h $PRE $RS") return 1 ;;
+    "$h $PRE") [ "$ADDED" = 1 ] && return 1 ;;
+  esac
+  return 0
 }
 
 # skip_reason: echo the first matching §7.1 skip reason (without "skipped:"), or nothing.
@@ -321,6 +340,8 @@ do_merge() {
 do_push() {
   local u=${1:-} retried=0
   while :; do
+    # the user may have switched branch or committed during the merge or the re-fetch: never push that.
+    if foreign_head; then RESULT="failed:branch-changed${STASH_SHA:+ (changes in $STASH_SHA)}"; return 1; fi
     if ! g merge-base --is-ancestor "$PRE" HEAD \
       || { [ -n "$RS" ] && ! g merge-base --is-ancestor "$RS" HEAD; }; then
       RESULT=failed:ancestry; restore; return 1
@@ -339,8 +360,9 @@ do_push() {
     retried=1
     git_net -C "$REPO_DIR" fetch --prune origin
     if [ "$RC" != 0 ]; then RESULT=failed:fetch; restore; return 1; fi
+    # PRE == HEAD since the push; anything else is the user's doing during the re-fetch.
+    on_pre || { RESULT="failed:branch-changed${STASH_SHA:+ (changes in $STASH_SHA)}"; return 1; }
     RS=$(g rev-parse -q --verify "$R") || { RS=""; RESULT=failed:push-rejected; restore; return 1; }
-    PRE=$(g rev-parse HEAD)
     classify || { restore; return 1; }
     case $STATE in
       behind|diverged) { ignored_guard && assert_clean_and_snap && do_merge; } || return 1 ;;
@@ -353,6 +375,15 @@ do_push() {
 restore() {
   local skip=0 p rdir
   [ -n "$PRE" ] || return 0
+  # a branch switch or HEAD move claude made is undone below; one the user made is never touched.
+  if [ "$CLAUDE_MOVED" != 1 ] && foreign_head; then
+    if [ "$(g rev-parse -q --verify "refs/heads/$B")" = "$PRE" ] && ! g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+      RESULT="failed:branch-changed${STASH_SHA:+ (changes in $STASH_SHA)}"
+    else
+      RESULT="failed:NEEDS-MANUAL-RECOVERY (HEAD moved outside reposync; PRE=$PRE${STASH_SHA:+ STASH_SHA=$STASH_SHA})"
+    fi
+    return 0
+  fi
   rdir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ "$DIRTY_MODE" = commit ] && [ "$ADDED" = 1 ]; then
     if [ "$(g rev-parse HEAD)" != "$PRE" ]; then PRE=$(g rev-parse HEAD); ADDED=0
@@ -453,6 +484,8 @@ snapshot_state() {
     echo "index $(g ls-files -s | cksum)"
     echo "config $(cksum <"$(gpath config)")"
     echo "hooks $(hooks_sum)"
+    refs_list >"$1.refs"
+    echo "refs $(cksum <"$1.refs")"
   } >"$1"
   untracked >"$1.u"
 }
@@ -462,6 +495,21 @@ hooks_sum() {
   local h
   h=$(gpath hooks)
   { echo "$h"; ls -lAR "$h"; find "$h" -type f -exec cat {} +; } 2>&1 | cksum
+}
+
+# refs_list: the refs claude must not touch, "<sha> <ref>" per line. Not B (the HEAD check covers it and restore resets
+# it), not refs/stash (the stash check), not refs/remotes/origin/* (fetch moves them).
+refs_list() {
+  g for-each-ref --format='%(objectname) %(refname)' \
+    | awk -v b="refs/heads/$B" '$2 != b && $2 != "refs/stash" && index($2, "refs/remotes/origin/") != 1'
+}
+
+# save_refs: claude changed the refs (a deleted branch loses its reflog): keep the before-list for manual recovery.
+save_refs() {
+  local d f
+  d=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ) f=$d/refs.before
+  mkdir -p "$d" && (set -C; cat "$TMPD/before.refs" >"$f") 2>/dev/null \
+    && NOTE="${NOTE:+$NOTE; }refs before claude saved to $f"
 }
 
 # subset FILE: every non-empty stdin line occurs in FILE (FILE may be empty, hence no NR == FNR).
@@ -504,16 +552,22 @@ claude_undo() {
 
 # claude_resolve merge|stash: §8.1/§8.2. 0 resolved (merge: committed; stash: unstaged), 1 failed (RESULT set, undone).
 claude_resolve() {
-  local kind=$1 c=$TMPD/conflicts bad p staged
+  local kind=$1 c=$TMPD/conflicts bad p staged h0
   if ! claude_ok; then RESULT=failed:claude-unavailable; claude_undo "$kind"; return 1; fi
   g diff -z --name-only --diff-filter=U >"$c.z"
   zhex <"$c.z" | LC_ALL=C sort >"$c"
   "write_${kind}_prompt" "$TMPD/prompt"
   snapshot_state "$TMPD/before"
+  h0="$(g rev-parse -q --verify HEAD) $(g symbolic-ref -q HEAD)"
   # shellcheck disable=SC2016  # $1/$@ expand in the child sh
   run_child "$TMPD/prompt" sh -c 'cd "$1" && shift && exec "$@"' _ "$REPO_DIR" \
     env -u CLAUDECODE GIT_ALLOW_PROTOCOL=none \
     "$TO" -k 30 "${REPOSYNC_CLAUDE_TIMEOUT:-900}" "$CLAUDE_BIN" -p --dangerously-skip-permissions
+  # whatever exit: a HEAD/branch change now is claude's, so restore may undo it; changed refs are saved.
+  # ponytail: a user who switches branch during the claude call is indistinguishable from claude (git refuses a
+  # checkout over the conflicted index, so it takes a forced one).
+  [ "$(g rev-parse -q --verify HEAD) $(g symbolic-ref -q HEAD)" = "$h0" ] || CLAUDE_MOVED=1
+  [ "$(refs_list | cksum)" = "$(cksum <"$TMPD/before.refs")" ] || save_refs
   if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then RESULT=failed:claude-timeout
   elif [ "$RC" != 0 ]; then RESULT="failed:claude (rc=$RC)"
   elif bad=$(verify_state "$kind" "$TMPD/before" "$c") && [ -n "$bad" ]; then
@@ -570,6 +624,7 @@ dirty_commit() {
   ADDED=1  # set before `add -A` so an interrupt at any point after this puts the index back (§7.6 step 0)
   if ! g add -A || ! staged=$(g write-tree); then RESULT=failed:commit; restore; return 1; fi
   commit_message "$msg"
+  on_pre || { RESULT=failed:branch-changed; restore; return 1; }
   if [ "$(g write-tree)" != "$staged" ]; then RESULT=failed:commit; restore; return 1; fi
   run_child /dev/null git -C "$REPO_DIR" commit -q -F "$msg"
   if [ "$RC" != 0 ]; then RESULT=failed:commit; restore; return 1; fi
@@ -668,9 +723,14 @@ sync_repo() {
   R=refs/remotes/origin/$B
   reason=$(skip_reason)
   if [ -n "$reason" ]; then RESULT=skipped:$reason; return; fi
-  PRE=$(g rev-parse HEAD)
   g rev-parse -q --verify "$R" >/dev/null 2>&1 && HAD_R=1
   fetch_repo || return
+  # the fetch can take minutes: re-check what the user may have changed meanwhile, then anchor PRE (empty until
+  # here, so a signal during the fetch restores nothing).
+  [ "$(g symbolic-ref -q HEAD)" = "refs/heads/$B" ] || { RESULT=skipped:branch-changed; return; }
+  reason=$(skip_reason)
+  if [ -n "$reason" ]; then RESULT=skipped:$reason; return; fi
+  PRE=$(g rev-parse HEAD)
   classify || return
   if [ "$DRY_RUN" = 1 ]; then
     # dirty (commit|keep): nothing is staged, committed or stashed; report what a real run would do.

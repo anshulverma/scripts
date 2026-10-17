@@ -6,7 +6,7 @@ echo "----" >>"$STUB_CLAUDE_LOG"
 case " $* " in
   *" --tools "*)  # commit-message call
     [ "${STUB_MSG_MODE:-}" = fail ] && exit 1
-    [ "${STUB_MSG_MODE:-}" = sleep ] && { echo $$ >"$T/stub.pid"; touch "$STUB_MARKER"; exec sleep 600; }
+    [ "${STUB_MSG_MODE:-}" = sleep ] && { echo $$ >"$T/stub.pid"; touch "$STUB_MARKER"; exec sleep "${STUB_SLEEP:-600}"; }
     printf '%s\n' "${STUB_MSG:-stub: commit message}"
     exit 0 ;;
 esac
@@ -30,6 +30,7 @@ case ${STUB_CLAUDE_MODE:-leave-markers} in
   user-file) echo notes >notes.md; exit 1 ;;
   checkout-other) git checkout -qf other ;;
   drop-stash) each resolve1; git stash drop -q ;;
+  delete-branch) each resolve1; git branch -q -D other ;;
   push-leak) git push origin HEAD:refs/heads/leak 2>>"$T/leak.err"; exit 1 ;;
   pwd) pwd -P >"$T/stub.cwd"; exit 1 ;;
   edit-other) each resolve1; echo extra >>other.txt ;;

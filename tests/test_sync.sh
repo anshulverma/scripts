@@ -200,3 +200,57 @@ t_tag_named_like_branch() {
   git --git-dir="$REMOTES/a.git" rev-parse -q --verify refs/heads/heads/main >/dev/null && fail "remote heads/main created"
   true
 }
+# I1: the user acts while a fetch (or a merge) runs; reposync must not act on state captured before it.
+t_branch_switch_during_fetch() {
+  make_repo a; git -C "$WS/a" checkout -qb wip; local_commit a w "WIP private"; git -C "$WS/a" checkout -q main
+  local w m rt; w=$(git -C "$WS/a" rev-parse wip) m=$(head_of a) rt=$(remote_head a)
+  slow_fetch a; start_reposync_bg; wait_marker "$T/fetching"
+  git -C "$WS/a" checkout -q wip
+  wait_bg 30; assert_rc 0
+  assert_eq "a${TAB}main${TAB}none${TAB}skipped:branch-changed" "$(row a)" row
+  assert_eq "$rt" "$(remote_head a)" remote
+  git --git-dir="$REMOTES/a.git" rev-parse -q --verify refs/heads/wip >/dev/null && fail "wip pushed"
+  assert_eq "$w" "$(git -C "$WS/a" rev-parse wip)" wip
+  assert_eq "$m" "$(git -C "$WS/a" rev-parse main)" main
+  assert_eq refs/heads/wip "$(git -C "$WS/a" symbolic-ref HEAD)" branch
+}
+t_commit_during_fetch_then_failure() {
+  make_repo a; echo x.log >>"$WS/a/.git/info/exclude"; echo mine >"$WS/a/x.log"; remote_commit a x.log theirs
+  slow_fetch a; start_reposync_bg; wait_marker "$T/fetching"
+  local_commit a g y; local c; c=$(head_of a)
+  wait_bg 30; assert_rc 1
+  case $(row a) in "a${TAB}main${TAB}none${TAB}failed:would-overwrite-ignored"*) ;; *) fail "row: $(row a)";; esac
+  assert_eq "$c" "$(git -C "$WS/a" rev-parse main)" "user commit on main"
+  assert_eq mine "$(cat "$WS/a/x.log")" x.log
+  assert_eq "" "$(git -C "$WS/a" status --porcelain)" status
+}
+t_push_refuses_if_branch_changed() {
+  # a post-merge hook stands in for the user checking out another branch between the merge and the push.
+  make_repo a; git -C "$WS/a" branch wip; local_commit a f x; remote_commit a g y
+  local w rt; w=$(git -C "$WS/a" rev-parse wip) rt=$(remote_head a)
+  hook "$WS/a/.git/hooks/post-merge" 'git checkout -q wip'
+  run_reposync; assert_rc 1
+  assert_eq "a${TAB}main${TAB}merged${TAB}failed:branch-changed" "$(row a)" row
+  assert_eq "$rt" "$(remote_head a)" remote
+  assert_eq "$w" "$(git -C "$WS/a" rev-parse wip)" wip
+  assert_eq refs/heads/wip "$(git -C "$WS/a" symbolic-ref HEAD)" branch
+  assert_eq 3 "$(git -C "$WS/a" rev-list --parents -n1 main | wc -w | tr -d ' ')" "merge kept on main"
+}
+t_push_retry_refuses_if_branch_changed() {
+  # the first push is rejected (a raced remote commit); the user checks out wip during the re-fetch.
+  make_repo a; git -C "$WS/a" branch wip; local_commit a f x; remote_commit a g y
+  local w m raced; w=$(git -C "$WS/a" rev-parse wip)
+  hook "$WS/a/.git/hooks/post-merge" "[ -e '$T/raced' ] && exit 0
+touch '$T/raced'
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+cd '$T/scratch/a' && echo race >race.txt && git add race.txt && git commit -qm race && git push -q origin HEAD:refs/heads/main"
+  slow_fetch a 2; start_reposync_bg; wait_marker "$T/fetching"
+  m=$(git -C "$WS/a" rev-parse main); git -C "$WS/a" checkout -q wip
+  wait_bg 30; assert_rc 1
+  assert_eq "a${TAB}main${TAB}merged${TAB}failed:branch-changed" "$(row a)" row
+  raced=$(git -C "$T/scratch/a" rev-parse HEAD)
+  assert_eq "$raced" "$(remote_head a)" remote
+  assert_eq "$w" "$(git -C "$WS/a" rev-parse wip)" wip
+  assert_eq "$m" "$(git -C "$WS/a" rev-parse main)" main
+  assert_eq refs/heads/wip "$(git -C "$WS/a" symbolic-ref HEAD)" branch
+}

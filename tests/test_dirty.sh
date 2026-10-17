@@ -200,3 +200,18 @@ t_commit_sigterm_during_message() {
   kill -0 "$(cat "$T/stub.pid")" 2>/dev/null && fail "stub still alive"
   true
 }
+t_branch_switch_during_commit_message() {
+  # the user checks out another branch during the commit-message call: no commit, and restore moves neither branch.
+  make_repo a; git -C "$WS/a" checkout -qb wip; local_commit a w WIP; git -C "$WS/a" checkout -q main
+  echo changed >"$WS/a/README"
+  local w m; w=$(git -C "$WS/a" rev-parse wip) m=$(head_of a)
+  STUB_MSG_MODE=sleep STUB_SLEEP=3 STUB_MARKER=$T/m start_reposync_bg --dirty=commit
+  wait_marker "$T/m"; git -C "$WS/a" checkout -q wip
+  wait_bg 30; assert_rc 1
+  assert_eq failed:branch-changed "$(result)" result
+  assert_eq "$m" "$(git -C "$WS/a" rev-parse main)" main
+  assert_eq "$w" "$(git -C "$WS/a" rev-parse wip)" wip
+  assert_eq refs/heads/wip "$(git -C "$WS/a" symbolic-ref HEAD)" branch
+  assert_eq changed "$(cat "$WS/a/README")" "user edit kept"
+  assert_eq "$m" "$(remote_head a)" remote
+}

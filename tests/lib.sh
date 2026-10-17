@@ -105,6 +105,28 @@ wait_bg() {
   OUT=$(cat "$T/bg.out"); ERR=$(cat "$T/bg.err")
 }
 
+# slow_fetch NAME [N]: from the Nth fetch of $WS/NAME on (default 1), upload-pack touches $T/fetching, then sleeps
+# 3 s before serving: a deterministic window in which a test acts like the user.
+slow_fetch() {
+  cat >"$T/slowpack" <<EOF
+#!/bin/sh
+n=\$(( \$(cat '$T/packs' 2>/dev/null || echo 0) + 1 )); echo \$n >'$T/packs'
+[ \$n -ge ${2:-1} ] && { touch '$T/fetching'; sleep 3; }
+exec git upload-pack "\$@"
+EOF
+  chmod +x "$T/slowpack"
+  git -C "$WS/$1" config remote.origin.uploadpack "$T/slowpack"
+}
+
+# wait_marker FILE: wait up to 10 s for FILE to exist (kill BGPID and fail otherwise).
+wait_marker() {
+  local i=0
+  while [ ! -e "$1" ]; do
+    [ "$i" -ge 100 ] && { kill -KILL "$BGPID"; fail "marker $1 never appeared"; }
+    sleep 0.1; i=$((i + 1))
+  done
+}
+
 row() { printf '%s\n' "$OUT" | awk -F'\t' -v n="$1" '$1 == n'; }
 
 assert_eq()       { [ "$1" = "$2" ] || fail "$3: expected [$1] got [$2]"; }

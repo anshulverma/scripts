@@ -183,3 +183,15 @@ t_commit_tree_check() {
   assert_eq "failed:claude-modified-git-state: commit-tree" "$(result)" result
   assert_eq other "$(cat "$WS/a/other.txt")" other.txt
 }
+t_claude_deletes_branch() {
+  # a deleted branch takes its reflog with it: the row names the refs check and refs.before keeps the old sha.
+  make_conflict a; git -C "$WS/a" branch other HEAD~1
+  local x r f; x=$(git -C "$WS/a" rev-parse other)
+  P=$(head_of a) RT=$(remote_head a)
+  STUB_CLAUDE_MODE=delete-branch run_reposync; assert_restored
+  r=$(result)
+  case $r in "failed:claude-modified-git-state: refs (refs before claude saved to $HOME/.local/state/reposync/rescue/a/"*"/refs.before)") ;;
+    *) fail "result: $r";; esac
+  f=${r#*saved to }; f=${f%)}
+  grep -qx "$x refs/heads/other" "$f" || fail "refs.before lacks other: $(cat "$f")"
+}

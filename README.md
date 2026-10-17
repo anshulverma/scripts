@@ -74,11 +74,11 @@ In `keep` mode, if the re-apply conflicts, claude resolves the conflicts. The st
 
 ### Skip reasons
 
-`not-git`, `no-origin`, `detached-head`, `no-commits`, `in-progress-op` (merge, cherry-pick, revert, bisect, rebase, or unmerged index entries), `upstream-mismatch` (upstream is not `origin/<branch>`), `dirty` (skip mode), `upstream-gone` (the remote branch was deleted; it is never recreated).
+`not-git`, `no-origin`, `detached-head`, `no-commits`, `in-progress-op` (merge, cherry-pick, revert, bisect, rebase, or unmerged index entries), `upstream-mismatch` (upstream is not `origin/<branch>`), `dirty` (skip mode), `upstream-gone` (the remote branch was deleted; it is never recreated), `branch-changed` (you checked out another branch while the fetch ran). All checks except `not-git` run again right after the fetch, so a repo you start editing or merging while its fetch runs is skipped too.
 
 ### Conflicts
 
-When a merge conflicts, reposync runs `claude -p --dangerously-skip-permissions` inside the repo with a prompt on stdin that lists the conflicted files and forbids git-mutating commands. Timeout: `REPOSYNC_CLAUDE_TIMEOUT` seconds (default 900). Afterwards reposync checks that claude changed nothing but the conflicted files (HEAD, branch, index, stash list, git config, hooks, other tracked files, untracked files) and that no conflict markers remain. Then it commits the merge itself (hooks run) and pushes. Any failed check undoes the merge. Without `claude` or `timeout` (`gtimeout`) the row is `failed:claude-unavailable` and the merge is undone.
+When a merge conflicts, reposync runs `claude -p --dangerously-skip-permissions` inside the repo with a prompt on stdin that lists the conflicted files and forbids git-mutating commands. Timeout: `REPOSYNC_CLAUDE_TIMEOUT` seconds (default 900). Afterwards reposync checks that claude changed nothing but the conflicted files (HEAD, branch, index, stash list, git config, hooks, other branches and tags, other tracked files, untracked files) and that no conflict markers remain. If claude changed other refs, the ref list from before the call is saved as `rescue/<repo>/<ts>/refs.before` (named in the row), because a deleted branch also loses its reflog. Then it commits the merge itself (hooks run) and pushes. Any failed check undoes the merge. Without `claude` or `timeout` (`gtimeout`) the row is `failed:claude-unavailable` and the merge is undone.
 
 ### Safety guarantees
 
@@ -91,6 +91,7 @@ When a merge conflicts, reposync runs `claude -p --dangerously-skip-permissions`
   - In `keep` mode the stash is re-applied; a stash that does not apply cleanly is kept.
 - Local commits and merges are kept when a push fails.
 - If the restore itself cannot reach the expected state, the row is `failed:NEEDS-MANUAL-RECOVERY` with the original commit (and stash sha) printed.
+- You can keep working while reposync runs. The start commit is taken after the fetch. Before every push and every reset, reposync checks that HEAD is still on the branch and at a commit it started from or made itself. If you switched branch or committed in between, it stops without pushing, re-pointing or resetting anything. The row is `failed:branch-changed` (a `keep` stash stays and is named), or `failed:NEEDS-MANUAL-RECOVERY (HEAD moved outside reposync; ...)` if the branch is no longer at the start commit. Only a branch switch made by claude is undone.
 - Before merging, it refuses (`failed:would-overwrite-ignored`) if the remote would overwrite an ignored or stashed-aside file.
 - A repo it cannot handle is skipped or reported as failed. The next repo is still processed.
 - Network git calls time out after 300 s (`timeout` or `gtimeout`, if installed). `GIT_TERMINAL_PROMPT=0` and an ssh `BatchMode` default keep cron runs from hanging on a prompt.
