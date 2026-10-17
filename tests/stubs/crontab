@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stub crontab: state in $HOME/crontab.txt, every invocation's args appended to $HOME/crontab.calls.
+f=$HOME/crontab.txt
+echo "$*" >>"$HOME/crontab.calls"
+case ${1:-} in
+  -l)
+    [ "${STUB_CRONTAB_FAIL:-}" = 1 ] && { echo "crontab: cannot open" >&2; exit 1; }
+    [ -f "$f" ] || { echo "no crontab for ${USER:-user}" >&2; exit 1; }
+    cat "$f" ;;
+  -) cat >"$f" ;;
+  -r)
+    [ -f "$f" ] || { echo "no crontab for ${USER:-user}" >&2; exit 1; }
+    rm -f "$f" ;;
+  *) echo "stub crontab: bad args $*" >&2; exit 2 ;;
+esac
