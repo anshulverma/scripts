@@ -192,18 +192,148 @@ fetch_repo() {
   return 1
 }
 
-# classify: sets STATE (§7.2).
+# classify: sets STATE (§7.2); returns 1 with RESULT=failed:classify if rev-list fails.
 classify() {
-  local a b
-  if [ -z "$RS" ]; then STATE=no-upstream; return; fi
+  local c a b
+  if [ -z "$RS" ]; then STATE=no-upstream; return 0; fi
+  c=$(g rev-list --left-right --count "HEAD...$R") || { RESULT=failed:classify; return 1; }
   read -r a b <<EOC
-$(g rev-list --left-right --count "HEAD...$R")
+$c
 EOC
   if [ "$a" = 0 ] && [ "$b" = 0 ]; then STATE=up-to-date
   elif [ "$b" = 0 ]; then STATE=ahead
   elif [ "$a" = 0 ]; then STATE=behind
   else STATE=diverged; fi
 }
+
+# ignored_guard: §7.3; on collision (or a failing git command) restore, set RESULT, return 1.
+ignored_guard() {
+  local p=$TMPD/guard.p i=$TMPD/guard.i hits
+  # quotePath=false on both sides: any remaining quoting is identical, so the comparison stays exact.
+  if ! g -c core.quotePath=false diff --no-renames --name-only --diff-filter=d "HEAD...$RS" >"$p" \
+    || ! g -c core.quotePath=false ls-files --others --ignored --exclude-standard >"$i"; then
+    RESULT=failed:would-overwrite-ignored; restore; return 1
+  fi
+  [ "$DIRTY_MODE" = keep ] && [ -n "$U" ] && printf '%s\n' "$U" >>"$i"
+  [ -s "$p" ] && [ -s "$i" ] || return 0
+  # collision: p = i, i under p/, or p under i/.
+  hits=$(awk 'NR == FNR { P[$0] = 1; n = split($0, a, "/"); s = a[1]
+                          for (k = 2; k <= n; k++) { A[s] = 1; s = s "/" a[k] }; next }
+              ($0 in P) || ($0 in A) { print; next }
+              { n = split($0, a, "/"); s = a[1]
+                for (k = 2; k <= n; k++) { if (s in P) { print; next }; s = s "/" a[k] } }' "$p" "$i" | sort -u | tr '\n' ' ')
+  [ -z "$hits" ] && return 0
+  RESULT="failed:would-overwrite-ignored: ${hits% }"
+  restore
+  return 1
+}
+
+# untracked: untracked non-ignored paths, sorted.
+# ponytail: line-based; names with newline, '"' or backslash (still C-quoted by git) are not rescued by restore step 1. Use -z if that matters.
+untracked() { g -c core.quotePath=false ls-files --others --exclude-standard | sort; }
+
+# assert_clean_and_snap: §7.3; dirty → restore, RESULT=failed:not-clean, return 1.
+assert_clean_and_snap() {
+  if [ -n "$(g status --porcelain --untracked-files=normal)" ]; then
+    RESULT=failed:not-clean; restore; return 1
+  fi
+  SNAP=$(untracked)
+  SNAP_TAKEN=1
+}
+
+# do_merge: §7.4 (STATE behind|diverged); 0 merged, 1 failed (RESULT set, restore run).
+do_merge() {
+  if [ "$STATE" = behind ]; then
+    run_child /dev/null git -C "$REPO_DIR" merge --ff-only "$R"
+  else
+    run_child /dev/null git -C "$REPO_DIR" -c merge.conflictStyle=zdiff3 merge --no-ff --no-edit "$R"
+  fi
+  if [ "$RC" = 0 ]; then
+    add_action merged
+    if [ "$STATE" = behind ]; then PRE=$(g rev-parse HEAD); SNAP=""; SNAP_TAKEN=0; fi
+    return 0
+  fi
+  if [ -n "$(g diff --name-only --diff-filter=U)" ]; then
+    claude_resolve merge || return 1
+    add_action merged
+    return 0
+  fi
+  RESULT=failed:merge
+  [ -s "$LASTERR" ] && RESULT="failed:merge: $(head -n 1 "$LASTERR")"
+  restore
+  return 1
+}
+
+# do_push [-u]: §7.5 incl. the single retry on a non-fast-forward rejection; 0 pushed, 1 failed.
+do_push() {
+  local u=${1:-} retried=0
+  while :; do
+    if ! g merge-base --is-ancestor "$PRE" HEAD \
+      || { [ -n "$RS" ] && ! g merge-base --is-ancestor "$RS" HEAD; }; then
+      RESULT=failed:ancestry; restore; return 1
+    fi
+    PRE=$(g rev-parse HEAD) SNAP="" SNAP_TAKEN=0
+    git_net -C "$REPO_DIR" push ${u:+"$u"} origin "HEAD:refs/heads/$B"
+    if [ "$RC" = 0 ]; then
+      [ -n "$u" ] && add_action set-upstream
+      add_action pushed
+      return 0
+    fi
+    if ! grep -Eq '^ ! \[rejected\] .*\((fetch first|non-fast-forward)\)$' "$LASTERR"; then
+      RESULT=failed:push; restore; return 1
+    fi
+    if [ "$retried" = 1 ]; then RESULT=failed:push-rejected; restore; return 1; fi
+    retried=1
+    git_net -C "$REPO_DIR" fetch --prune origin
+    if [ "$RC" != 0 ]; then RESULT=failed:fetch; restore; return 1; fi
+    RS=$(g rev-parse -q --verify "$R") || { RS=""; RESULT=failed:push-rejected; restore; return 1; }
+    PRE=$(g rev-parse HEAD)
+    classify || { restore; return 1; }
+    case $STATE in
+      behind|diverged) { ignored_guard && assert_clean_and_snap && do_merge; } || return 1 ;;
+    esac
+  done
+}
+
+# restore: §7.6 steps 0-3 and 5; step 4 is keep_restore. Overrides RESULT only on a failed post-condition.
+restore() {
+  local skip=0 p dir="" list
+  [ -n "$PRE" ] || return 0
+  if [ "$DIRTY_MODE" = commit ] && [ "$ADDED" = 1 ]; then
+    if [ "$(g rev-parse HEAD)" != "$PRE" ]; then PRE=$(g rev-parse HEAD); ADDED=0
+    else g read-tree "$SAVED_TREE"; skip=1; fi
+  fi
+  if [ "$skip" = 0 ]; then
+    if [ "$SNAP_TAKEN" = 1 ]; then
+      list=$(untracked)
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        printf '%s\n' "$SNAP" | grep -Fxq -- "$p" && continue
+        [ -n "$dir" ] || dir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        mkdir -p "$(dirname "$dir/$p")" && mv "$REPO_DIR/$p" "$dir/$p"
+      done <<EOL
+$list
+EOL
+      [ -n "$dir" ] && NOTE="${NOTE:+$NOTE; }untracked files moved to $dir"
+    fi
+    g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && g merge --abort
+    p=0
+    if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ]; then g symbolic-ref HEAD "refs/heads/$B"; p=1; fi
+    if [ "$p" = 1 ] || [ "$(g rev-parse HEAD)" != "$PRE" ]; then
+      if [ "$SNAP_TAKEN" = 1 ]; then g reset -q --hard "$PRE"; else g reset -q "$PRE"; fi
+    fi
+  fi
+  keep_restore
+  if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ] || [ "$(g rev-parse HEAD)" != "$PRE" ] \
+    || g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || [ -n "$(g ls-files -u)" ]; then
+    RESULT="failed:NEEDS-MANUAL-RECOVERY (PRE=$PRE${STASH_SHA:+ STASH_SHA=$STASH_SHA})"
+  fi
+}
+
+# Task 4 replaces this stub (§8.1/§8.2).
+claude_resolve() { RESULT=failed:claude-unavailable; restore; return 1; }
+# Task 5 implements §7.6 step 4.
+keep_restore() { :; }
 
 leftover_warnings() {
   local line re='^On [^:]*: reposync-keep '
@@ -216,20 +346,17 @@ $(g stash list --format='%H %s' 2>/dev/null)
 EOL
 }
 
-process_repo() {
+# sync_repo: §7 for one repo (REPO_DIR set, is a repo); sets RESULT.
+sync_repo() {
   local reason
-  reset_repo_state
-  REPO_DIR=$1 REPO_NAME=${1##*/}
-  if ! is_repo; then emit_row skipped:not-git; return; fi
   B=$(g symbolic-ref -q --short HEAD 2>/dev/null)
   R=refs/remotes/origin/$B
   reason=$(skip_reason)
-  if [ -n "$reason" ]; then emit_row "skipped:$reason"; leftover_warnings; return; fi
+  if [ -n "$reason" ]; then RESULT=skipped:$reason; return; fi
   PRE=$(g rev-parse HEAD)
   g rev-parse -q --verify "$R" >/dev/null 2>&1 && HAD_R=1
-  if ! fetch_repo; then emit_row "$RESULT"; leftover_warnings; return; fi
-  classify
-  # ponytail: merge/push arrive in Task 3; dry-run only reports the planned steps.
+  fetch_repo || return
+  classify || return
   if [ "$DRY_RUN" = 1 ]; then
     case $STATE in
       ahead) ACTIONS=pushed ;;
@@ -237,8 +364,28 @@ process_repo() {
       diverged) ACTIONS=merged+pushed ;;
       no-upstream) ACTIONS=set-upstream+pushed ;;
     esac
+    RESULT=ok
+    return
   fi
-  emit_row ok
+  # >>> Task 5 hook: --dirty=commit|keep handling runs here (after classify, before the guard).
+  # No-op for --dirty=skip (dirty repos were skipped) and clean trees.
+  case $STATE in
+    behind|diverged) { ignored_guard && assert_clean_and_snap && do_merge; } || return ;;
+  esac
+  case $STATE in
+    ahead|diverged) do_push || return ;;
+    no-upstream) do_push -u || return ;;
+  esac
+  RESULT=ok
+  keep_restore
+}
+
+process_repo() {
+  reset_repo_state
+  REPO_DIR=$1 REPO_NAME=${1##*/}
+  if ! is_repo; then emit_row skipped:not-git; return; fi
+  sync_repo
+  emit_row "$RESULT${NOTE:+ ($NOTE)}"
   leftover_warnings
 }
 
