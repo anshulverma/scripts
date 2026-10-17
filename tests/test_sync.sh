@@ -148,3 +148,40 @@ t_merge_rescues_untracked() {
   assert_eq "$pre" "$(head_of a)" HEAD
   assert_eq "" "$(git -C "$WS/a" status --porcelain)" status
 }
+t_ignored_guard_quoted_dirfile() {
+  # names git C-quotes (core.quotePath) must still collide: compare raw (NUL-delimited) names.
+  make_repo a; printf 'q"d/\n' >>"$WS/a/.git/info/exclude"; mkdir "$WS/a/q\"d"; echo mine >"$WS/a/q\"d/data"
+  remote_commit a 'q"d' theirs
+  guard_check 'q"d/data' mine "$(head_of a)"
+}
+# iso_at EPOCH: ISO UTC timestamp (GNU or BSD date).
+iso_at() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+t_rescue_odd_names() {
+  make_repo a; local_commit a f x; remote_commit a g y
+  local nl s now rd r dir
+  nl=$(printf 'n\nl.'); nl=${nl%.}
+  hook "$WS/a/.git/hooks/post-merge" "printf x >'a\"b'
+printf y >'$nl'
+printf z >'b\\s'
+git reset -q --hard HEAD~1"
+  # pre-existing rescued files for the next seconds: a later move must never overwrite them.
+  rd=$HOME/.local/state/reposync/rescue/a; now=$(date +%s)
+  for s in 0 1 2 3 4 5 6 7 8 9 10 11; do mkdir -p "$rd/$(iso_at $((now + s)))"; echo old >"$rd/$(iso_at $((now + s)))/a\"b"; done
+  run_reposync; assert_rc 1
+  r=$(row a)
+  case $r in *"failed:ancestry (untracked files moved to $rd/"*")") ;; *) fail "row: $r";; esac
+  dir=${r#*untracked files moved to }; dir=${dir%)}
+  assert_eq x "$(cat "$dir/a\"b.1")" 'a"b moved to a"b.1'
+  assert_eq y "$(cat "$dir/$nl")" "newline name moved"
+  assert_eq z "$(cat "$dir/b\\s")" "backslash name moved"
+  for s in "$rd"/*/a\"b; do assert_eq old "$(cat "$s")" "seed $s overwritten"; done
+  assert_eq "" "$(git -C "$WS/a" status --porcelain)" status
+}
+t_rescue_note_only_when_moved() {
+  make_repo a; local_commit a f x; remote_commit a g y
+  hook "$WS/a/.git/hooks/post-merge" 'git reset -q --hard HEAD~1'
+  run_reposync; assert_rc 1
+  assert_eq "a${TAB}main${TAB}merged${TAB}failed:ancestry" "$(row a)" row
+  [ -e "$HOME/.local/state/reposync/rescue" ] && fail "rescue dir created with nothing to move"
+  true
+}

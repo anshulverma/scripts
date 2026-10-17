@@ -206,31 +206,63 @@ EOC
   else STATE=diverged; fi
 }
 
+# zhex: NUL-delimited names on stdin → one line per name, its bytes as space-separated hex ("61 2f 62").
+# Exact for any name (quotes, backslashes, newlines, non-ASCII) yet line-oriented, so awk/sort/variables can hold it.
+zhex() { od -An -v -tx1 | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) if ($i == "00") { print r; r = "" } else r = (r == "" ? $i : r " " $i) }'; }
+# unhex HEXLINE VAR: decode one zhex line into VAR (printf -v keeps trailing newlines).
+unhex() { printf -v "$2" '%b' "\\x${1// /\\x}"; }
+
+# untracked: untracked non-ignored paths as sorted zhex lines (SNAP and, in keep mode, U use this format).
+untracked() { g ls-files -z --others --exclude-standard | zhex | LC_ALL=C sort; }
+
 # ignored_guard: §7.3; on collision (or a failing git command) restore, set RESULT, return 1.
 ignored_guard() {
   local p=$TMPD/guard.p i=$TMPD/guard.i hits
-  # quotePath=false on both sides: any remaining quoting is identical, so the comparison stays exact.
-  if ! g -c core.quotePath=false diff --no-renames --name-only --diff-filter=d "HEAD...$RS" >"$p" \
-    || ! g -c core.quotePath=false ls-files --others --ignored --exclude-standard >"$i"; then
+  if ! g diff -z --no-renames --name-only --diff-filter=d "HEAD...$RS" >"$p.z" \
+    || ! g ls-files -z --others --ignored --exclude-standard >"$i.z"; then
     RESULT=failed:would-overwrite-ignored; restore; return 1
   fi
+  zhex <"$p.z" >"$p"
+  zhex <"$i.z" >"$i"
   [ "$DIRTY_MODE" = keep ] && [ -n "$U" ] && printf '%s\n' "$U" >>"$i"
   [ -s "$p" ] && [ -s "$i" ] || return 0
-  # collision: p = i, i under p/, or p under i/.
-  hits=$(awk 'NR == FNR { P[$0] = 1; n = split($0, a, "/"); s = a[1]
-                          for (k = 2; k <= n; k++) { A[s] = 1; s = s "/" a[k] }; next }
-              ($0 in P) || ($0 in A) { print; next }
-              { n = split($0, a, "/"); s = a[1]
-                for (k = 2; k <= n; k++) { if (s in P) { print; next }; s = s "/" a[k] } }' "$p" "$i" | sort -u | tr '\n' ' ')
+  # Raw names compared as zhex lines; "/" is the token 2f. Collision: p = i, i under p/, or p under i/.
+  # Hits are printed with non-printable bytes and backslash as \ooo so the row stays one line.
+  hits=$(LC_ALL=C awk '
+    function show(s,   n, t, k, v, o, x) { x = "0123456789abcdef"; n = split(s, t, " "); o = ""
+      for (k = 1; k <= n; k++) { v = (index(x, substr(t[k], 1, 1)) - 1) * 16 + index(x, substr(t[k], 2, 1)) - 1
+        o = o ((v >= 32 && v < 127 && v != 92) ? sprintf("%c", v) : sprintf("\\%03o", v)) }
+      return o }
+    NR == FNR { P[$0] = 1; n = split($0, a, " 2f "); s = a[1]
+                for (k = 2; k <= n; k++) { A[s] = 1; s = s " 2f " a[k] }; next }
+    ($0 in P) || ($0 in A) { print show($0); next }
+    { n = split($0, a, " 2f "); s = a[1]
+      for (k = 2; k <= n; k++) { if (s in P) { print show($0); next }; s = s " 2f " a[k] } }' "$p" "$i" | LC_ALL=C sort -u | tr '\n' ' ')
   [ -z "$hits" ] && return 0
   RESULT="failed:would-overwrite-ignored: ${hits% }"
   restore
   return 1
 }
 
-# untracked: untracked non-ignored paths, sorted.
-# ponytail: line-based; names with newline, '"' or backslash (still C-quoted by git) are not rescued by restore step 1. Use -z if that matters.
-untracked() { g -c core.quotePath=false ls-files --others --exclude-standard | sort; }
+# rescue_untracked: §7.6 step 1. Move (never delete, never overwrite) every untracked path not in SNAP.
+rescue_untracked() {
+  local h p dir dest n moved=0
+  printf '%s\n' "$SNAP" >"$TMPD/snap"
+  untracked >"$TMPD/now"
+  LC_ALL=C awk 'NR == FNR { S[$0] = 1; next } $0 != "" && !($0 in S)' "$TMPD/snap" "$TMPD/now" >"$TMPD/move"
+  dir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  while IFS= read -r h; do
+    unhex "$h" p
+    dest=$dir/$p n=0
+    while [ "$n" -lt 100 ]; do
+      mkdir -p "${dest%/*}" && mv -n "$REPO_DIR/$p" "$dest" 2>/dev/null
+      if [ ! -e "$REPO_DIR/$p" ] && [ ! -L "$REPO_DIR/$p" ]; then moved=1; break; fi
+      n=$((n + 1)) dest=$dir/$p.$n
+    done
+  done <"$TMPD/move"
+  [ "$moved" = 1 ] && NOTE="${NOTE:+$NOTE; }untracked files moved to $dir"
+  return 0
+}
 
 # assert_clean_and_snap: §7.3; dirty → restore, RESULT=failed:not-clean, return 1.
 assert_clean_and_snap() {
@@ -297,25 +329,14 @@ do_push() {
 
 # restore: §7.6 steps 0-3 and 5; step 4 is keep_restore. Overrides RESULT only on a failed post-condition.
 restore() {
-  local skip=0 p dir="" list
+  local skip=0 p
   [ -n "$PRE" ] || return 0
   if [ "$DIRTY_MODE" = commit ] && [ "$ADDED" = 1 ]; then
     if [ "$(g rev-parse HEAD)" != "$PRE" ]; then PRE=$(g rev-parse HEAD); ADDED=0
     else g read-tree "$SAVED_TREE"; skip=1; fi
   fi
   if [ "$skip" = 0 ]; then
-    if [ "$SNAP_TAKEN" = 1 ]; then
-      list=$(untracked)
-      while IFS= read -r p; do
-        [ -n "$p" ] || continue
-        printf '%s\n' "$SNAP" | grep -Fxq -- "$p" && continue
-        [ -n "$dir" ] || dir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        mkdir -p "$(dirname "$dir/$p")" && mv "$REPO_DIR/$p" "$dir/$p"
-      done <<EOL
-$list
-EOL
-      [ -n "$dir" ] && NOTE="${NOTE:+$NOTE; }untracked files moved to $dir"
-    fi
+    [ "$SNAP_TAKEN" = 1 ] && rescue_untracked
     g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && g merge --abort
     p=0
     if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ]; then g symbolic-ref HEAD "refs/heads/$B"; p=1; fi
