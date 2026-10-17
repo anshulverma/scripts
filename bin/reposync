@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # reposync: sync every git repo directly under the workspace with its remote.
-# Globals and helpers below are consumed by later tasks (unused until then).
-# shellcheck disable=SC2034,SC2317
+# shellcheck disable=SC2034,SC2317  # later tasks use the per-repo globals and add_action; trap-only functions
 set -u
 
 export GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_MERGE_AUTOEDIT=no
@@ -15,6 +14,9 @@ if command -v timeout >/dev/null 2>&1; then TO=timeout
 elif command -v gtimeout >/dev/null 2>&1; then TO=gtimeout; fi
 CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 HAVE_LOCK=0 CHILD="" RC=0 FAILED=0 IN_REPO=0 FROM_SIGNAL=0
+# per-repo state (see reset_repo_state)
+REPO_DIR="" REPO_NAME="" B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
+SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT=""
 TMPD=$(mktemp -d) || { echo "reposync: cannot create temp dir" >&2; exit 2; }
 OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err
 : >"$OUTF"; : >"$ERRF"; : >"$LASTERR"
@@ -115,13 +117,141 @@ git_net() {
   else run_child /dev/null git "$@"; fi
 }
 
+reset_repo_state() {
+  B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
+  SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT=""
+}
+
+# g ARGS...: git in the current repo, stdin from /dev/null.
+g() { git -C "$REPO_DIR" "$@" </dev/null; }
+
+add_action() {
+  case "+$ACTIONS+" in *"+$1+"*) return ;; esac
+  ACTIONS=${ACTIONS:+$ACTIONS+}$1
+}
+
+# emit_row RESULT: one row per repo; dry-run prefixes the action with would- and adds the state column.
+emit_row() {
+  local act=${ACTIONS:-none} st=$STATE
+  case $1 in failed:*) FAILED=1 ;; esac
+  if [ "$DRY_RUN" = 1 ]; then
+    [ -n "$ACTIONS" ] && act=would-$ACTIONS
+    case $1 in skipped:dirty) st=dirty ;; skipped:*|failed:*) st=$1 ;; esac
+    printf '%s\t%s\t%s\t%s\t%s\n' "$REPO_NAME" "${B:--}" "$act" "$1" "$st"
+  else
+    printf '%s\t%s\t%s\t%s\n' "$REPO_NAME" "${B:--}" "$act" "$1"
+  fi
+}
+
+is_repo() {
+  local top phys
+  [ "$(g rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || return 1
+  top=$(g rev-parse --show-toplevel 2>/dev/null) || return 1
+  phys=$(cd -P "$REPO_DIR" 2>/dev/null && pwd -P) || return 1
+  [ "$top" = "$phys" ]
+}
+
+# skip_reason: echo the first matching §7.1 skip reason (without "skipped:"), or nothing.
+skip_reason() {
+  local n p merge remote
+  g config --get remote.origin.url >/dev/null 2>&1 || { echo no-origin; return; }
+  [ -n "$B" ] || { echo detached-head; return; }
+  g rev-parse -q --verify HEAD >/dev/null 2>&1 || { echo no-commits; return; }
+  for n in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG rebase-merge rebase-apply; do
+    p=$(g rev-parse --git-path "$n" 2>/dev/null)
+    case $p in /*) ;; *) p=$REPO_DIR/$p ;; esac
+    [ -e "$p" ] && { echo in-progress-op; return; }
+  done
+  [ -z "$(g ls-files -u 2>/dev/null)" ] || { echo in-progress-op; return; }
+  if merge=$(g config --get "branch.$B.merge" 2>/dev/null); then
+    remote=$(g config --get "branch.$B.remote" 2>/dev/null)
+    { [ "$remote" = origin ] && [ "$merge" = "refs/heads/$B" ]; } || { echo upstream-mismatch; return; }
+  fi
+  if [ "$DIRTY_MODE" = skip ] && [ -n "$(g status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+    echo dirty
+  fi
+}
+
+# fetch_repo: §7.1 fetch; returns 1 with RESULT set on fetch failure or upstream-gone.
+fetch_repo() {
+  local fa=--prune
+  [ "$DRY_RUN" = 1 ] && fa=--no-prune
+  git_net -C "$REPO_DIR" fetch "$fa" origin
+  if [ "$RC" != 0 ]; then RESULT=failed:fetch; return 1; fi
+  RS=$(g rev-parse -q --verify "$R" 2>/dev/null) && return 0
+  RS=""
+  if g config --get "branch.$B.merge" >/dev/null 2>&1; then :
+  elif [ "$HAD_R" = 1 ]; then
+    if [ "$DRY_RUN" != 1 ]; then
+      g config "branch.$B.merge" "refs/heads/$B" && g config "branch.$B.remote" origin
+    fi
+  else
+    return 0  # no upstream, R never existed: new branch
+  fi
+  RESULT=skipped:upstream-gone
+  return 1
+}
+
+# classify: sets STATE (§7.2).
+classify() {
+  local a b
+  if [ -z "$RS" ]; then STATE=no-upstream; return; fi
+  read -r a b <<EOC
+$(g rev-list --left-right --count "HEAD...$R")
+EOC
+  if [ "$a" = 0 ] && [ "$b" = 0 ]; then STATE=up-to-date
+  elif [ "$b" = 0 ]; then STATE=ahead
+  elif [ "$a" = 0 ]; then STATE=behind
+  else STATE=diverged; fi
+}
+
+leftover_warnings() {
+  local line re='^On [^:]*: reposync-keep '
+  while IFS= read -r line; do
+    [[ ${line#* } =~ $re ]] || continue
+    echo "WARN $REPO_NAME: leftover reposync stash ${line%% *}"
+    FAILED=1
+  done <<EOL
+$(g stash list --format='%H %s' 2>/dev/null)
+EOL
+}
+
+process_repo() {
+  local reason
+  reset_repo_state
+  REPO_DIR=$1 REPO_NAME=${1##*/}
+  if ! is_repo; then emit_row skipped:not-git; return; fi
+  B=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+  R=refs/remotes/origin/$B
+  reason=$(skip_reason)
+  if [ -n "$reason" ]; then emit_row "skipped:$reason"; leftover_warnings; return; fi
+  PRE=$(g rev-parse HEAD)
+  g rev-parse -q --verify "$R" >/dev/null 2>&1 && HAD_R=1
+  if ! fetch_repo; then emit_row "$RESULT"; leftover_warnings; return; fi
+  classify
+  # ponytail: merge/push arrive in Task 3; dry-run only reports the planned steps.
+  if [ "$DRY_RUN" = 1 ]; then
+    case $STATE in
+      ahead) ACTIONS=pushed ;;
+      behind) ACTIONS=merged ;;
+      diverged) ACTIONS=merged+pushed ;;
+      no-upstream) ACTIONS=set-upstream+pushed ;;
+    esac
+  fi
+  emit_row ok
+  leftover_warnings
+}
+
 trap 'release_lock; rm -rf "$TMPD"' EXIT
 
 main() {
   parse_args "$@"
   resolve_workspace
   acquire_lock
-  # repo loop arrives in Task 2
+  local d
+  for d in "$WS"/*/; do
+    [ -d "$d" ] && process_repo "${d%/}"
+  done
   exit "$FAILED"
 }
 
