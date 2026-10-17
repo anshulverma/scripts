@@ -1,5 +1,39 @@
 #!/usr/bin/env bash
-# Stub claude: record stdin; behaviour modes arrive in later tasks.
+# shellcheck disable=SC2317  # resolve1/base_marker1 are invoked through each
+# Stub claude: log stdin, then act per STUB_CLAUDE_MODE (cwd = the repo; T comes from the test env).
 cat >>"$STUB_CLAUDE_LOG"
 echo "----" >>"$STUB_CLAUDE_LOG"
+case " $* " in
+  *" --tools "*)  # commit-message call
+    [ "${STUB_MSG_MODE:-}" = fail ] && exit 1
+    printf '%s\n' "${STUB_MSG:-stub: commit message}"
+    exit 0 ;;
+esac
+git diff -z --name-only --diff-filter=U >"$T/stub.conf"
+# each CMD...: run CMD... PATH for every conflicted path (NUL-safe).
+each() { local f; while IFS= read -r -d '' f; do "$@" "$f"; done <"$T/stub.conf"; }
+# resolve1 PATH: keep both sides; drop markers and the zdiff3 base section; only the first ======= is the separator.
+resolve1() {
+  awk '/^<<<<<<< /{c=1;s=0;next} c&&/^\|\|\|\|\|\|\| /{b=1;next} c&&!s&&/^=======$/{b=0;s=1;next} c&&/^>>>>>>> /{c=0;next} !b{print}' \
+    "$1" >"$T/stub.tmp" && cat "$T/stub.tmp" >"$1"
+}
+base_marker1() { echo '||||||| base' >>"$1"; }
+case ${STUB_CLAUDE_MODE:-leave-markers} in
+  resolve) each resolve1 ;;
+  leave-markers) ;;
+  exit-1) exit 1 ;;
+  sleep) echo $$ >"$T/stub.pid"; touch "${STUB_MARKER:-$T/stub.marker}"; exec sleep "${STUB_SLEEP:-600}" ;;
+  commit) each resolve1; git add -A && git commit -qm x ;;
+  reset-hard) git reset -q --hard "origin/$(git symbolic-ref --short HEAD)" ;;
+  untracked) each resolve1; echo x >stray.txt ;;
+  user-file) echo notes >notes.md; exit 1 ;;
+  checkout-other) git checkout -qf other ;;
+  drop-stash) each resolve1; git stash drop -q ;;
+  push-leak) git push origin HEAD:refs/heads/leak 2>>"$T/leak.err"; exit 1 ;;
+  pwd) pwd -P >"$T/stub.cwd"; exit 1 ;;
+  edit-other) each resolve1; echo extra >>other.txt ;;
+  stage) each resolve1; each git add -A -- ;;
+  base-marker) each resolve1; each base_marker1 ;;
+  *) echo "stub claude: unknown mode $STUB_CLAUDE_MODE" >&2; exit 2 ;;
+esac
 exit 0

@@ -327,7 +327,8 @@ do_push() {
   done
 }
 
-# restore: §7.6 steps 0-3 and 5; step 4 is keep_restore. Overrides RESULT only on a failed post-condition.
+# restore [nokeep]: §7.6 steps 0-3 and 5; step 4 is keep_restore (skipped with nokeep, §8.2).
+# Overrides RESULT only on a failed post-condition.
 restore() {
   local skip=0 p
   [ -n "$PRE" ] || return 0
@@ -342,17 +343,162 @@ restore() {
     if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ]; then g symbolic-ref HEAD "refs/heads/$B"; p=1; fi
     if [ "$p" = 1 ] || [ "$(g rev-parse HEAD)" != "$PRE" ]; then
       if [ "$SNAP_TAKEN" = 1 ]; then g reset -q --hard "$PRE"; else g reset -q "$PRE"; fi
+    elif [ "$SNAP_TAKEN" = 1 ] && [ -n "$(g status --porcelain --untracked-files=no)" ]; then
+      # the tree was clean at SNAP and new untracked paths are already rescued: tracked edits made since
+      # (e.g. claude outside the conflicted set, which merge --abort keeps) are undone.
+      g reset -q --hard "$PRE"
     fi
   fi
-  keep_restore
+  [ "${1:-}" = nokeep ] || keep_restore
   if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ] || [ "$(g rev-parse HEAD)" != "$PRE" ] \
     || g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || [ -n "$(g ls-files -u)" ]; then
     RESULT="failed:NEEDS-MANUAL-RECOVERY (PRE=$PRE${STASH_SHA:+ STASH_SHA=$STASH_SHA})"
   fi
 }
 
-# Task 4 replaces this stub (§8.1/§8.2).
-claude_resolve() { RESULT=failed:claude-unavailable; restore; return 1; }
+claude_ok() { [ -n "$CLAUDE_BIN" ] && [ -n "$TO" ]; }
+
+FORBIDDEN='git commit, git merge (including --continue and --abort), git reset, git checkout, git switch,
+git restore, git stash, git rebase, git pull, git push, git add, git rm, git clean, git branch'
+
+# prompt_conflicts / prompt_rules: the parts shared by both §8.1 and §8.2 prompts.
+prompt_conflicts() {
+  echo "Conflicted files (git status --porcelain code, then path):"
+  g status --porcelain -z --untracked-files=no | tr '\0' '\n' | grep -E '^(DD|AU|UD|UA|DU|AA|UU) '
+}
+prompt_rules() {
+  cat <<EOP
+
+Rules:
+- Edit only the conflicted files listed above.
+- Modify/delete conflict: either delete the file or keep the modified version.
+- Binary file: pick one side with \`git show :2:<path>\` (ours) or \`git show :3:<path>\` (theirs).
+- Read-only git commands and builds/tests are allowed.
+Do not run any of these git commands:
+$FORBIDDEN
+
+Edit the files in place and exit; do not stage or commit.
+EOP
+}
+
+# write_merge_prompt FILE: §8.1 prompt.
+write_merge_prompt() {
+  local base
+  base=$(g merge-base HEAD MERGE_HEAD)
+  {
+    echo "Repository: $REPO_DIR"
+    echo "Branch: $B"
+    echo
+    echo "You are resolving a merge of origin/$B (theirs, remote) into local $B (ours)."
+    echo "Keep the intent of both sides."
+    echo
+    prompt_conflicts
+    echo
+    echo "Local commits (git log --oneline -20 $base..HEAD):"
+    g log --no-color --oneline -20 "$base..HEAD"
+    echo
+    echo "Remote commits (git log --oneline -20 $base..MERGE_HEAD):"
+    g log --no-color --oneline -20 "$base..MERGE_HEAD"
+    prompt_rules
+  } >"$1"
+}
+
+# write_stash_prompt FILE: §8.2 prompt.
+write_stash_prompt() {
+  {
+    echo "Repository: $REPO_DIR"
+    echo "Branch: $B"
+    echo
+    echo "You are re-applying the user's uncommitted local changes (the \`Stashed changes\` side, from stash $STASH_SHA)" \
+      "on top of the updated branch (the \`Updated upstream\` side = HEAD, which already contains the remote changes)." \
+      "Preserve the user's local edits while keeping the upstream changes."
+    echo
+    prompt_conflicts
+    echo
+    echo "Upstream commits (git log --oneline -20 $STASH_SHA^1..HEAD):"
+    g log --no-color --oneline -20 "$STASH_SHA^1..HEAD"
+    prompt_rules
+  } >"$1"
+}
+
+# snapshot_state FILE: what claude must not change, one "<check> <value>" line each; untracked list in FILE.u.
+snapshot_state() {
+  {
+    echo "HEAD $(g rev-parse -q --verify HEAD)"
+    echo "MERGE_HEAD $(g rev-parse -q --verify MERGE_HEAD)"
+    echo "branch $(g symbolic-ref -q HEAD)"
+    echo "stash $(g stash list --format=%H | cksum)"
+    echo "index $(g ls-files -s | cksum)"
+  } >"$1"
+  untracked >"$1.u"
+}
+
+# subset FILE: every non-empty stdin line occurs in FILE (FILE may be empty, hence no NR == FNR).
+subset() { LC_ALL=C awk 'FILENAME == ARGV[1] { S[$0] = 1; next } $0 != "" && !($0 in S) { exit 1 }' "$1" -; }
+
+# verify_state KIND BEFORE CONFLICTS: echo the first failed check (nothing if all hold).
+# CONFLICTS = the conflicted set as zhex lines.
+verify_state() {
+  local a=$TMPD/after bad
+  snapshot_state "$a"
+  bad=$(LC_ALL=C awk 'NR == FNR { v[FNR] = $0; next } $0 != v[FNR] { print $1; exit }' "$2" "$a")
+  if [ -z "$bad" ] && [ "$1" = merge ] && [ "$(g rev-parse -q --verify MERGE_HEAD)" != "$RS" ]; then bad=MERGE_HEAD; fi
+  if [ -z "$bad" ] && ! g diff -z --name-only | zhex | subset "$3"; then bad=worktree; fi
+  if [ -z "$bad" ] && ! subset "$2.u" <"$a.u"; then bad=untracked; fi
+  echo "$bad"
+}
+
+# marker_check PATHFILE: 1 if an added line in the staged diff of any (NUL-delimited) path is a conflict marker.
+# ======= never counts (setext headings); binary paths are skipped.
+marker_check() {
+  local p
+  while IFS= read -r -d '' p; do
+    case $(g --literal-pathspecs diff --cached --numstat HEAD -- "$p") in -*) continue ;; esac
+    g --literal-pathspecs diff --cached --no-color --no-ext-diff --no-textconv HEAD -U0 -- "$p" \
+      | grep -Eq '^\+(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)( |$)' && return 1
+  done <"$1"
+  return 0
+}
+
+# claude_undo KIND: undo after a failed resolve (RESULT set). stash: unstage, restore without step 4 (§8.2).
+claude_undo() {
+  if [ "$1" = stash ]; then
+    g reset -q
+    RESULT="failed:keep-restore (changes in $STASH_SHA)"
+    restore nokeep
+  else
+    restore
+  fi
+}
+
+# claude_resolve merge|stash: §8.1/§8.2. 0 resolved (merge: committed; stash: unstaged), 1 failed (RESULT set, undone).
+claude_resolve() {
+  local kind=$1 c=$TMPD/conflicts bad p
+  if ! claude_ok; then RESULT=failed:claude-unavailable; claude_undo "$kind"; return 1; fi
+  g diff -z --name-only --diff-filter=U >"$c.z"
+  zhex <"$c.z" | LC_ALL=C sort >"$c"
+  "write_${kind}_prompt" "$TMPD/prompt"
+  snapshot_state "$TMPD/before"
+  # shellcheck disable=SC2016  # $1/$@ expand in the child sh
+  run_child "$TMPD/prompt" sh -c 'cd "$1" && shift && exec "$@"' _ "$REPO_DIR" \
+    env -u CLAUDECODE GIT_ALLOW_PROTOCOL=none \
+    "$TO" -k 30 "${REPOSYNC_CLAUDE_TIMEOUT:-900}" "$CLAUDE_BIN" -p --dangerously-skip-permissions
+  if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then RESULT=failed:claude-timeout
+  elif [ "$RC" != 0 ]; then RESULT="failed:claude (rc=$RC)"
+  elif bad=$(verify_state "$kind" "$TMPD/before" "$c") && [ -n "$bad" ]; then
+    RESULT="failed:claude-modified-git-state: $bad"
+  else
+    while IFS= read -r -d '' p; do g --literal-pathspecs add -A -- "$p"; done <"$c.z"
+    if [ -n "$(g ls-files -u)" ] || ! marker_check "$c.z"; then RESULT=failed:merge-conflict-unresolved
+    elif [ "$kind" = stash ]; then g reset -q; return 0
+    elif ! g commit -q --no-edit; then RESULT=failed:merge
+    elif [ "$(g rev-list --parents -n1 HEAD)" != "$(g rev-parse HEAD) $PRE $RS" ]; then RESULT=failed:ancestry
+    else return 0
+    fi
+  fi
+  claude_undo "$kind"
+  return 1
+}
 # Task 5 implements §7.6 step 4.
 keep_restore() { :; }
 
@@ -405,12 +551,29 @@ process_repo() {
   reset_repo_state
   REPO_DIR=$1 REPO_NAME=${1##*/}
   if ! is_repo; then emit_row skipped:not-git; return; fi
+  IN_REPO=1
   sync_repo
+  IN_REPO=0
   emit_row "$RESULT${NOTE:+ ($NOTE)}"
   leftover_warnings
 }
 
+# on_signal CODE: §9. Stop the child, restore the in-progress repo (never calls claude), report, exit CODE.
+on_signal() {
+  trap '' INT TERM HUP
+  if [ -n "$CHILD" ]; then kill -TERM "$CHILD" 2>/dev/null; wait "$CHILD"; CHILD=""; fi
+  FROM_SIGNAL=1
+  if [ "$IN_REPO" = 1 ]; then
+    RESULT=failed:interrupted
+    restore
+    emit_row "$RESULT${NOTE:+ ($NOTE)}"
+  fi
+  exit "$1"
+}
+
 trap 'release_lock; rm -rf "$TMPD"' EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM HUP
 
 main() {
   parse_args "$@"

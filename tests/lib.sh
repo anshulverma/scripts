@@ -20,6 +20,8 @@ setup_env() {
 	conflictStyle = zdiff3
 GC
   export PATH=$TESTS/stubs:$PATH
+  # tests must only ever reach the stub, never a real claude
+  [ "$(command -v claude)" = "$TESTS/stubs/claude" ] || fail "claude resolves to $(command -v claude), not the stub"
   export STUB_CLAUDE_LOG=$T/claude.stdin
   # shellcheck disable=SC2064
   trap "rm -rf '$T'" EXIT
@@ -57,6 +59,24 @@ local_commit() {
     && git commit -q -m "local $2") || fail "local_commit: $1 $2"
 }
 
+# make_conflict NAME [REMOTE_LINE1] [FILE...]: base commit with README (l1..l6), other.txt and each FILE (l1..l6);
+# line 1 of README and each FILE becomes "local" in $WS/NAME and REMOTE_LINE1 (default "remote") on the remote.
+make_conflict() {
+  local n=$1 r=${2:-remote} f rest base
+  shift; [ $# -gt 0 ] && shift
+  rest=$(printf 'l%s\n' 2 3 4 5 6); base="l1
+$rest"
+  make_repo "$n"
+  (cd "$WS/$n" && for f in README "$@"; do printf '%s\n' "$base" >"$f"; done && echo other >other.txt \
+    && git add -A && git commit -qm base && git push -q origin HEAD:refs/heads/main 2>/dev/null) || fail "make_conflict: base"
+  for f in README "$@"; do
+    local_commit "$n" "$f" "local
+$rest"
+    remote_commit "$n" "$f" "$r
+$rest"
+  done
+}
+
 remote_head() { git --git-dir="$REMOTES/$1.git" rev-parse "refs/heads/${2:-main}"; }
 
 # _run CMD...: run from $T (never the scripts repo), set OUT ERR RC.
@@ -78,7 +98,7 @@ start_reposync_bg() {
 wait_bg() {
   local i=0 max=$(( $1 * 10 ))
   while kill -0 "$BGPID" 2>/dev/null; do
-    [ "$i" -ge "$max" ] && fail "wait_bg: pid $BGPID still running after $1s"
+    if [ "$i" -ge "$max" ]; then kill -KILL "$BGPID" 2>/dev/null; fail "wait_bg: pid $BGPID still running after $1s"; fi
     sleep 0.1; i=$((i + 1))
   done
   wait "$BGPID"; RC=$?
