@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub claude: record stdin; behaviour modes arrive in later tasks.
+cat >>"$STUB_CLAUDE_LOG"
+echo "----" >>"$STUB_CLAUDE_LOG"
+exit 0

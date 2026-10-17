@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# reposync: sync every git repo directly under the workspace with its remote.
+# Globals and helpers below are consumed by later tasks (unused until then).
+# shellcheck disable=SC2034,SC2317
+set -u
+
+export GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_MERGE_AUTOEDIT=no
+[ -n "${GIT_SSH_COMMAND:-}" ] || export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30'
+
+# run-level state
+WS="" WS_ARG="" DIRTY_MODE=skip DRY_RUN=0
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/reposync
+TO=""
+if command -v timeout >/dev/null 2>&1; then TO=timeout
+elif command -v gtimeout >/dev/null 2>&1; then TO=gtimeout; fi
+CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+HAVE_LOCK=0 CHILD="" RC=0 FAILED=0 IN_REPO=0 FROM_SIGNAL=0
+TMPD=$(mktemp -d) || { echo "reposync: cannot create temp dir" >&2; exit 2; }
+OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err
+: >"$OUTF"; : >"$ERRF"; : >"$LASTERR"
+
+usage() {
+  cat <<'USAGE'
+usage: reposync [--dirty=skip|commit|keep] [--dry-run] [--workspace DIR] [-h|--help]
+
+Sync every git repo directly under the workspace with its remote.
+
+  --dirty=skip|commit|keep  dirty working trees: skip (default), commit them, or keep (stash around the merge)
+  --dry-run                 fetch only; report what would happen
+  --workspace DIR           workspace directory
+  -h, --help                show this help
+
+Workspace resolution order: --workspace DIR, $WORKSPACE_DIR,
+~/.config/dotsync2/constants.env, then $HOME/workspace.
+
+Exit codes:
+  0    every repo ok or skipped
+  1    any repo failed, or a leftover warning
+  2    usage or workspace error
+  3    another run holds the lock
+  130  interrupted (INT)
+  143  terminated (TERM/HUP)
+USAGE
+}
+
+die_usage() { echo "reposync: $1" >&2; usage >&2; exit 2; }
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help) usage; exit 0 ;;
+      --dirty=skip|--dirty=commit|--dirty=keep) DIRTY_MODE=${1#--dirty=} ;;
+      --dirty=*) die_usage "bad --dirty value: ${1#--dirty=}" ;;
+      --dry-run) DRY_RUN=1 ;;
+      --workspace)
+        { [ $# -ge 2 ] && [ -n "$2" ]; } || die_usage "--workspace needs a directory"
+        WS_ARG=$2; shift ;;
+      *) die_usage "unknown argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+resolve_workspace() {
+  local f
+  if [ -n "$WS_ARG" ]; then
+    WS=$WS_ARG
+  else
+    if [ -z "${WORKSPACE_DIR:-}" ]; then
+      f=$HOME/.config/dotsync2/constants.env
+      # shellcheck source=/dev/null
+      [ -f "$f" ] && . "$f"
+    fi
+    WS=${WORKSPACE_DIR:-$HOME/workspace}
+  fi
+  [ -d "$WS" ] || { echo "reposync: workspace not found: $WS" >&2; exit 2; }
+}
+
+acquire_lock() {
+  local pid
+  mkdir -p "$STATE_DIR" || { echo "reposync: cannot create $STATE_DIR" >&2; exit 2; }
+  if ! mkdir "$STATE_DIR/lock" 2>/dev/null; then
+    pid=$(cat "$STATE_DIR/lock/pid" 2>/dev/null || true)
+    if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
+      echo "reposync: another run (pid ${pid:-?}) holds the lock" >&2
+      exit 3
+    fi
+    rm -rf "$STATE_DIR/lock"
+    if ! mkdir "$STATE_DIR/lock" 2>/dev/null; then
+      echo "reposync: another run (pid ?) holds the lock" >&2
+      exit 3
+    fi
+  fi
+  echo $$ >"$STATE_DIR/lock/pid"
+  HAVE_LOCK=1
+}
+
+release_lock() { [ "$HAVE_LOCK" = 1 ] && rm -rf "$STATE_DIR/lock"; HAVE_LOCK=0; }
+
+# run_child INFILE CMD...: background + wait so traps fire promptly; sets RC.
+run_child() {
+  local infile=$1
+  shift
+  "$@" >"$OUTF" 2>"$LASTERR" <"$infile" &
+  CHILD=$!
+  wait "$CHILD"
+  RC=$?
+  CHILD=""
+  cat "$LASTERR" >>"$ERRF"
+  cat "$LASTERR" >&2
+}
+
+git_net() {
+  if [ -n "$TO" ]; then run_child /dev/null "$TO" -k 10 300 git "$@"
+  else run_child /dev/null git "$@"; fi
+}
+
+trap 'release_lock; rm -rf "$TMPD"' EXIT
+
+main() {
+  parse_args "$@"
+  resolve_workspace
+  acquire_lock
+  # repo loop arrives in Task 2
+  exit "$FAILED"
+}
+
+main "$@"
