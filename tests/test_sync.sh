@@ -185,3 +185,18 @@ t_rescue_note_only_when_moved() {
   [ -e "$HOME/.local/state/reposync/rescue" ] && fail "rescue dir created with nothing to move"
   true
 }
+t_tag_named_like_branch() {
+  # B must be the branch name even when a tag shares it (symbolic-ref --short would print heads/main).
+  make_repo a; git -C "$WS/a" tag main
+  run_reposync; assert_rc 0
+  assert_eq "a${TAB}main${TAB}none${TAB}ok" "$(row a)" "up-to-date row"
+  assert_eq refs/heads/main "$(git -C "$WS/a" symbolic-ref HEAD)" "up-to-date branch"
+  local_commit a f x
+  run_reposync; assert_rc 0
+  assert_eq "a${TAB}main${TAB}pushed${TAB}ok" "$(row a)" "ahead row"
+  assert_eq refs/heads/main "$(git -C "$WS/a" symbolic-ref HEAD)" "ahead branch"
+  assert_eq "$(git -C "$WS/a" rev-parse refs/heads/main)" "$(remote_head a)" "remote refs/heads/main"
+  git -C "$WS/a" rev-parse -q --verify refs/heads/heads/main >/dev/null && fail "refs/heads/heads/main created"
+  git --git-dir="$REMOTES/a.git" rev-parse -q --verify refs/heads/heads/main >/dev/null && fail "remote heads/main created"
+  true
+}

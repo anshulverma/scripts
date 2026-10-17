@@ -662,7 +662,9 @@ EOL
 # sync_repo: §7 for one repo (REPO_DIR set, is a repo); sets RESULT.
 sync_repo() {
   local reason st
-  B=$(g symbolic-ref -q --short HEAD 2>/dev/null)
+  # full ref, not --short: --short prints heads/B when a tag is also named B. Non-branch symref → detached-head skip.
+  B=$(g symbolic-ref -q HEAD 2>/dev/null)
+  case $B in refs/heads/?*) B=${B#refs/heads/} ;; *) B="" ;; esac
   R=refs/remotes/origin/$B
   reason=$(skip_reason)
   if [ -n "$reason" ]; then RESULT=skipped:$reason; return; fi
