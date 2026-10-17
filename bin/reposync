@@ -151,6 +151,14 @@ is_repo() {
   [ "$top" = "$phys" ]
 }
 
+# gpath NAME: absolute path of `git rev-parse --git-path NAME` (git prints it relative to the repo).
+gpath() {
+  local p
+  p=$(g rev-parse --git-path "$1" 2>/dev/null) || return 1
+  case $p in /*) ;; *) p=$REPO_DIR/$p ;; esac
+  printf '%s\n' "$p"
+}
+
 # skip_reason: echo the first matching §7.1 skip reason (without "skipped:"), or nothing.
 skip_reason() {
   local n p merge remote
@@ -158,8 +166,7 @@ skip_reason() {
   [ -n "$B" ] || { echo detached-head; return; }
   g rev-parse -q --verify HEAD >/dev/null 2>&1 || { echo no-commits; return; }
   for n in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG rebase-merge rebase-apply; do
-    p=$(g rev-parse --git-path "$n" 2>/dev/null)
-    case $p in /*) ;; *) p=$REPO_DIR/$p ;; esac
+    p=$(gpath "$n")
     [ -e "$p" ] && { echo in-progress-op; return; }
   done
   [ -z "$(g ls-files -u 2>/dev/null)" ] || { echo in-progress-op; return; }
@@ -244,13 +251,12 @@ ignored_guard() {
   return 1
 }
 
-# rescue_untracked: §7.6 step 1. Move (never delete, never overwrite) every untracked path not in SNAP.
+# rescue_untracked DIR: §7.6 step 1. Move (never delete, never overwrite) every untracked path not in SNAP into DIR.
 rescue_untracked() {
-  local h p dir dest n moved=0
+  local h p dir=$1 dest n moved=0
   printf '%s\n' "$SNAP" >"$TMPD/snap"
   untracked >"$TMPD/now"
   LC_ALL=C awk 'NR == FNR { S[$0] = 1; next } $0 != "" && !($0 in S)' "$TMPD/snap" "$TMPD/now" >"$TMPD/move"
-  dir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
   while IFS= read -r h; do
     unhex "$h" p
     dest=$dir/$p n=0
@@ -262,6 +268,20 @@ rescue_untracked() {
   done <"$TMPD/move"
   [ "$moved" = 1 ] && NOTE="${NOTE:+$NOTE; }untracked files moved to $dir"
   return 0
+}
+
+# save_tracked DIR: before a reset --hard, save uncommitted tracked changes (index + worktree vs HEAD) as
+# DIR/tracked.patch (tracked.patch.N if taken; never overwrite). Returns 1 if they could not be saved.
+save_tracked() {
+  local f=$1/tracked.patch n=0 t=$TMPD/tracked.patch
+  g diff --binary --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ HEAD >"$t" || return 1
+  [ -s "$t" ] || return 0
+  mkdir -p "$1" || return 1
+  until (set -C; cat "$t" >"$f") 2>/dev/null; do
+    n=$((n + 1)) f=$1/tracked.patch.$n
+    [ "$n" -lt 100 ] || return 1
+  done
+  NOTE="${NOTE:+$NOTE; }tracked changes saved to $f"
 }
 
 # assert_clean_and_snap: §7.3; dirty → restore, RESULT=failed:not-clean, return 1.
@@ -330,23 +350,24 @@ do_push() {
 # restore [nokeep]: §7.6 steps 0-3 and 5; step 4 is keep_restore (skipped with nokeep, §8.2).
 # Overrides RESULT only on a failed post-condition.
 restore() {
-  local skip=0 p
+  local skip=0 p rdir
   [ -n "$PRE" ] || return 0
+  rdir=$STATE_DIR/rescue/$REPO_NAME/$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ "$DIRTY_MODE" = commit ] && [ "$ADDED" = 1 ]; then
     if [ "$(g rev-parse HEAD)" != "$PRE" ]; then PRE=$(g rev-parse HEAD); ADDED=0
     else g read-tree "$SAVED_TREE"; skip=1; fi
   fi
   if [ "$skip" = 0 ]; then
-    [ "$SNAP_TAKEN" = 1 ] && rescue_untracked
+    [ "$SNAP_TAKEN" = 1 ] && rescue_untracked "$rdir"
     g rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 && g merge --abort
     p=0
     if [ "$(g symbolic-ref -q HEAD)" != "refs/heads/$B" ]; then g symbolic-ref HEAD "refs/heads/$B"; p=1; fi
     if [ "$p" = 1 ] || [ "$(g rev-parse HEAD)" != "$PRE" ]; then
-      if [ "$SNAP_TAKEN" = 1 ]; then g reset -q --hard "$PRE"; else g reset -q "$PRE"; fi
+      if [ "$SNAP_TAKEN" = 1 ]; then save_tracked "$rdir" && g reset -q --hard "$PRE"; else g reset -q "$PRE"; fi
     elif [ "$SNAP_TAKEN" = 1 ] && [ -n "$(g status --porcelain --untracked-files=no)" ]; then
-      # the tree was clean at SNAP and new untracked paths are already rescued: tracked edits made since
-      # (e.g. claude outside the conflicted set, which merge --abort keeps) are undone.
-      g reset -q --hard "$PRE"
+      # the tree was clean at SNAP: tracked edits made since (claude outside the conflicted set, which merge --abort
+      # keeps, or the user during the run) are saved as a patch, then undone. Unsaveable → no reset (manual recovery).
+      save_tracked "$rdir" && g reset -q --hard "$PRE"
     fi
   fi
   [ "${1:-}" = nokeep ] || keep_restore
@@ -429,8 +450,17 @@ snapshot_state() {
     echo "branch $(g symbolic-ref -q HEAD)"
     echo "stash $(g stash list --format=%H | cksum)"
     echo "index $(g ls-files -s | cksum)"
+    echo "config $(cksum <"$(gpath config)")"
+    echo "hooks $(hooks_sum)"
   } >"$1"
   untracked >"$1.u"
+}
+
+# hooks_sum: digest of the effective hooks dir (honours core.hooksPath): its path, listing (names, modes) and contents.
+hooks_sum() {
+  local h
+  h=$(gpath hooks)
+  { echo "$h"; ls -lAR "$h"; find "$h" -type f -exec cat {} +; } 2>&1 | cksum
 }
 
 # subset FILE: every non-empty stdin line occurs in FILE (FILE may be empty, hence no NR == FNR).
@@ -473,7 +503,7 @@ claude_undo() {
 
 # claude_resolve merge|stash: §8.1/§8.2. 0 resolved (merge: committed; stash: unstaged), 1 failed (RESULT set, undone).
 claude_resolve() {
-  local kind=$1 c=$TMPD/conflicts bad p
+  local kind=$1 c=$TMPD/conflicts bad p staged
   if ! claude_ok; then RESULT=failed:claude-unavailable; claude_undo "$kind"; return 1; fi
   g diff -z --name-only --diff-filter=U >"$c.z"
   zhex <"$c.z" | LC_ALL=C sort >"$c"
@@ -491,7 +521,9 @@ claude_resolve() {
     while IFS= read -r -d '' p; do g --literal-pathspecs add -A -- "$p"; done <"$c.z"
     if [ -n "$(g ls-files -u)" ] || ! marker_check "$c.z"; then RESULT=failed:merge-conflict-unresolved
     elif [ "$kind" = stash ]; then g reset -q; return 0
+    elif ! staged=$(g write-tree); then RESULT=failed:merge
     elif ! g commit -q --no-edit; then RESULT=failed:merge
+    elif [ "$(g rev-parse "HEAD^{tree}")" != "$staged" ]; then RESULT="failed:claude-modified-git-state: commit-tree"
     elif [ "$(g rev-list --parents -n1 HEAD)" != "$(g rev-parse HEAD) $PRE $RS" ]; then RESULT=failed:ancestry
     else return 0
     fi

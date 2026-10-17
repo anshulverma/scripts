@@ -5,7 +5,7 @@ head_of() { git -C "$WS/$1" rev-parse HEAD; }
 make_minbin() {
   local t p
   mkdir -p "$T/minbin"
-  for t in bash env sh git mktemp cat rm mkdir date od awk sort tr head grep mv cksum "$@"; do
+  for t in bash env sh git mktemp cat rm mkdir date od awk sort tr head grep mv cksum ls find "$@"; do
     p=$(type -P "$t") || fail "make_minbin: $t not found"
     ln -s "$p" "$T/minbin/$t"
   done
@@ -153,4 +153,33 @@ t_push_blocked_for_child() {
   assert_eq "a${TAB}main${TAB}none${TAB}failed:claude (rc=1)" "$(row a)" row
   git --git-dir="$REMOTES/a.git" rev-parse -q --verify refs/heads/leak >/dev/null && fail "leak pushed"
   assert_contains "$(cat "$T/leak.err")" "transport 'file' not allowed"
+}
+t_tracked_edit_rescued() {
+  conflict_run edit-tracked-fail; assert_restored
+  local r f; r=$(result)
+  case $r in "failed:claude (rc=1) (tracked changes saved to $HOME/.local/state/reposync/rescue/a/"*/tracked.patch")") ;;
+    *) fail "result: $r";; esac
+  assert_eq other "$(cat "$WS/a/other.txt")" "other.txt restored"
+  f=${r#*tracked changes saved to }; f=${f%)}
+  grep -qx '+extra' "$f" || fail "patch lacks the edit: $(cat "$f")"
+  git -C "$WS/a" apply "$f" || fail "patch does not apply"
+  assert_eq "other
+extra" "$(cat "$WS/a/other.txt")" "patch reproduces the edit"
+}
+t_claude_installs_hook() {
+  conflict_run install-hook; assert_restored
+  assert_eq "failed:claude-modified-git-state: hooks" "$(result)" result
+}
+t_claude_changes_config() {
+  conflict_run set-config; assert_restored
+  assert_eq "failed:claude-modified-git-state: config" "$(result)" result
+}
+t_commit_tree_check() {
+  # a pre-commit hook (here pre-existing, so the hooks check passes) must not get unverified content into the merge.
+  make_conflict a; P=$(head_of a) RT=$(remote_head a)
+  printf '#!/bin/sh\necho injected >>other.txt; git add other.txt\n' >"$WS/a/.git/hooks/pre-commit"
+  chmod +x "$WS/a/.git/hooks/pre-commit"
+  STUB_CLAUDE_MODE=resolve run_reposync; assert_restored
+  assert_eq "failed:claude-modified-git-state: commit-tree" "$(result)" result
+  assert_eq other "$(cat "$WS/a/other.txt")" other.txt
 }

@@ -32,6 +32,11 @@ case ${STUB_CLAUDE_MODE:-leave-markers} in
   push-leak) git push origin HEAD:refs/heads/leak 2>>"$T/leak.err"; exit 1 ;;
   pwd) pwd -P >"$T/stub.cwd"; exit 1 ;;
   edit-other) each resolve1; echo extra >>other.txt ;;
+  edit-tracked-fail) echo extra >>other.txt; exit 1 ;;
+  install-hook)
+    h=$(git rev-parse --git-path hooks)/pre-commit
+    printf '#!/bin/sh\necho injected >>other.txt; git add other.txt\n' >"$h" && chmod +x "$h" && each resolve1 ;;
+  set-config) git config core.hooksPath x && each resolve1 ;;
   stage) each resolve1; each git add -A -- ;;
   base-marker) each resolve1; each base_marker1 ;;
   *) echo "stub claude: unknown mode $STUB_CLAUDE_MODE" >&2; exit 2 ;;
