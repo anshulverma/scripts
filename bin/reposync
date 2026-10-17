@@ -16,7 +16,7 @@ CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 HAVE_LOCK=0 CHILD="" RC=0 FAILED=0 IN_REPO=0 FROM_SIGNAL=0
 # per-repo state (see reset_repo_state)
 REPO_DIR="" REPO_NAME="" B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
-SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT=""
+SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT="" KSTATE="" KOLD=""
 TMPD=$(mktemp -d) || { echo "reposync: cannot create temp dir" >&2; exit 2; }
 OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err
 : >"$OUTF"; : >"$ERRF"; : >"$LASTERR"
@@ -119,11 +119,14 @@ git_net() {
 
 reset_repo_state() {
   B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0
-  SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT=""
+  SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT="" KSTATE="" KOLD=""
 }
 
 # g ARGS...: git in the current repo, stdin from /dev/null.
 g() { git -C "$REPO_DIR" "$@" </dev/null; }
+
+# dirty: tracked changes or untracked non-ignored files.
+dirty() { [ -n "$(g status --porcelain --untracked-files=normal)" ]; }
 
 add_action() {
   case "+$ACTIONS+" in *"+$1+"*) return ;; esac
@@ -174,9 +177,7 @@ skip_reason() {
     remote=$(g config --get "branch.$B.remote" 2>/dev/null)
     { [ "$remote" = origin ] && [ "$merge" = "refs/heads/$B" ]; } || { echo upstream-mismatch; return; }
   fi
-  if [ "$DIRTY_MODE" = skip ] && [ -n "$(g status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
-    echo dirty
-  fi
+  if [ "$DIRTY_MODE" = skip ] && dirty 2>/dev/null; then echo dirty; fi
 }
 
 # fetch_repo: §7.1 fetch; returns 1 with RESULT set on fetch failure or upstream-gone.
@@ -286,7 +287,7 @@ save_tracked() {
 
 # assert_clean_and_snap: §7.3; dirty → restore, RESULT=failed:not-clean, return 1.
 assert_clean_and_snap() {
-  if [ -n "$(g status --porcelain --untracked-files=normal)" ]; then
+  if dirty; then
     RESULT=failed:not-clean; restore; return 1
   fi
   SNAP=$(untracked)
@@ -531,8 +532,121 @@ claude_resolve() {
   claude_undo "$kind"
   return 1
 }
-# Task 5 implements §7.6 step 4.
-keep_restore() { :; }
+
+# commit_message FILE: §8.3. claude (no tools) writes the message from the staged diff; fallback on any failure.
+commit_message() {
+  local p=$TMPD/msg.prompt first
+  {
+    echo "Write a git commit message for the staged changes below. Output only the commit message:"
+    echo "a subject line of at most 72 characters, optionally followed by a blank line and a body."
+    echo "No quotes, no markdown."
+    echo
+    echo "git diff --cached --stat:"
+    g diff --cached --stat --no-color
+    echo
+    echo "git diff --cached (first 500 lines):"
+    g diff --cached --no-color --no-ext-diff --no-textconv | head -n 500
+  } >"$p"
+  : >"$1"
+  if claude_ok; then
+    # shellcheck disable=SC2016  # $1/$@ expand in the child sh
+    run_child "$p" sh -c 'cd "$1" && shift && exec "$@"' _ "$REPO_DIR" \
+      env -u CLAUDECODE GIT_ALLOW_PROTOCOL=none "$TO" -k 10 60 "$CLAUDE_BIN" -p --tools ""
+    # drop code-fence lines, then leading and trailing blank lines
+    [ "$RC" = 0 ] && awk '/^[ \t]*```/ { next } NF { s = 1 } s { l[++n] = $0; if (NF) e = n }
+      END { for (i = 1; i <= e; i++) print l[i] }' "$OUTF" >"$1"
+  fi
+  first=$(head -n 1 "$1")
+  if [ -z "$first" ] || [ "${#first}" -gt 72 ]; then
+    printf 'reposync: auto-commit from %s at %s\n' "$HOSTNAME" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$1"
+  fi
+}
+
+# dirty_commit: §7.3 commit mode. Commits all changes (hooks run), then reclassifies; 1 with RESULT set on failure.
+dirty_commit() {
+  local staged msg=$TMPD/msg
+  dirty || return 0
+  if ! SAVED_TREE=$(g write-tree) || [ -z "$SAVED_TREE" ]; then SAVED_TREE=""; RESULT=failed:commit; return 1; fi
+  ADDED=1  # set before `add -A` so an interrupt at any point after this puts the index back (§7.6 step 0)
+  if ! g add -A || ! staged=$(g write-tree); then RESULT=failed:commit; restore; return 1; fi
+  commit_message "$msg"
+  if [ "$(g write-tree)" != "$staged" ]; then RESULT=failed:commit; restore; return 1; fi
+  run_child /dev/null git -C "$REPO_DIR" commit -q -F "$msg"
+  if [ "$RC" != 0 ]; then RESULT=failed:commit; restore; return 1; fi
+  ADDED=0 PRE=$(g rev-parse HEAD)
+  add_action committed
+  classify || { restore; return 1; }
+}
+
+# dirty_keep_stash: §7.3 keep mode. Stash everything (incl. untracked); STASH_SHA stays empty if nothing was stashed.
+dirty_keep_stash() {
+  local rc
+  U=$(untracked)
+  KOLD=$(g rev-parse -q --verify refs/stash)
+  KSTATE=pushing  # a signal trap from here on reads STASH_SHA itself (keep_stash_sha), so the stash is re-applied
+  g stash push -q --include-untracked -m "reposync-keep $(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2
+  rc=$?
+  keep_stash_sha
+  if [ "$rc" != 0 ]; then RESULT=failed:stash; restore; return 1; fi
+}
+
+# keep_stash_sha: STASH_SHA = the entry `git stash push` created (empty if refs/stash did not change).
+keep_stash_sha() {
+  STASH_SHA=$(g rev-parse -q --verify refs/stash)
+  [ "$STASH_SHA" = "$KOLD" ] && STASH_SHA=""
+  KSTATE=""
+  [ -n "$STASH_SHA" ] && echo "reposync: $REPO_NAME: stashed local changes: $STASH_SHA" >&2
+  return 0
+}
+
+# drop_kept_stash: drop the stash@{n} whose sha is STASH_SHA (never by position alone).
+drop_kept_stash() {
+  local n=0 sha
+  while IFS= read -r sha; do
+    if [ "$sha" = "$STASH_SHA" ]; then g stash drop -q "stash@{$n}" >&2; return; fi
+    n=$((n + 1))
+  done <<EOS
+$(g stash list --format=%H)
+EOS
+}
+
+# keep_restore: §7.6 step 4. The entry is dropped only after a clean apply. KSTATE guards re-entry from the
+# signal trap (during the apply or its claude call): then only unstage and report, never apply twice.
+keep_restore() {
+  local prev=$RESULT rc resolved=0
+  [ "$KSTATE" = pushing ] && keep_stash_sha
+  [ "$DIRTY_MODE" = keep ] && [ -n "$STASH_SHA" ] && [ "$KSTATE" != finished ] || return 0
+  if [ "$KSTATE" = applying ]; then
+    [ -n "$(g ls-files -u)" ] && g reset -q
+    KSTATE=finished RESULT="failed:interrupted (changes in $STASH_SHA)"
+    return 0
+  fi
+  # steps 1-3 are done: files the apply brings back are the user's, so a nested restore (§8.2 failure) must
+  # never rescue them or reset --hard over them.
+  KSTATE=applying SNAP_TAKEN=0
+  if g stash apply -q --index "$STASH_SHA" >&2; then rc=0
+  else
+    g reset -q --merge >&2
+    g stash apply -q "$STASH_SHA" >&2
+    rc=$?
+  fi
+  if [ "$rc" = 0 ] && [ -z "$(g ls-files -u)" ]; then
+    drop_kept_stash
+    KSTATE=finished STASH_SHA=""
+    return 0
+  fi
+  if [ -n "$(g ls-files -u)" ]; then
+    if [ "$FROM_SIGNAL" = 1 ]; then g reset -q
+    elif claude_resolve stash; then resolved=1
+    fi
+  fi
+  KSTATE=finished
+  case $RESULT in failed:NEEDS-MANUAL-RECOVERY*) return 0 ;; esac
+  if [ -n "$prev" ]; then RESULT="$prev (changes in $STASH_SHA)"
+  elif [ "$resolved" = 1 ]; then NOTE="${NOTE:+$NOTE; }local changes merged with conflicts; originals kept in $STASH_SHA"
+  else RESULT="failed:keep-restore (changes in $STASH_SHA)"
+  fi
+}
 
 leftover_warnings() {
   local line re='^On [^:]*: reposync-keep '
@@ -547,7 +661,7 @@ EOL
 
 # sync_repo: §7 for one repo (REPO_DIR set, is a repo); sets RESULT.
 sync_repo() {
-  local reason
+  local reason st
   B=$(g symbolic-ref -q --short HEAD 2>/dev/null)
   R=refs/remotes/origin/$B
   reason=$(skip_reason)
@@ -557,17 +671,26 @@ sync_repo() {
   fetch_repo || return
   classify || return
   if [ "$DRY_RUN" = 1 ]; then
-    case $STATE in
+    # dirty (commit|keep): nothing is staged, committed or stashed; report what a real run would do.
+    st=$STATE
+    if [ "$DIRTY_MODE" != skip ] && dirty; then
+      STATE=dirty
+      [ "$DIRTY_MODE" = commit ] && case $st in behind) st=diverged ;; up-to-date) st=ahead ;; esac
+    fi
+    case $st in
       ahead) ACTIONS=pushed ;;
       behind) ACTIONS=merged ;;
       diverged) ACTIONS=merged+pushed ;;
       no-upstream) ACTIONS=set-upstream+pushed ;;
     esac
+    [ "$STATE" = dirty ] && [ "$DIRTY_MODE" = commit ] && ACTIONS=committed${ACTIONS:++$ACTIONS}
     RESULT=ok
     return
   fi
-  # >>> Task 5 hook: --dirty=commit|keep handling runs here (after classify, before the guard).
-  # No-op for --dirty=skip (dirty repos were skipped) and clean trees.
+  case $DIRTY_MODE in
+    commit) dirty_commit || return ;;
+    keep) dirty_keep_stash || return ;;
+  esac
   case $STATE in
     behind|diverged) { ignored_guard && assert_clean_and_snap && do_merge; } || return ;;
   esac
@@ -575,8 +698,9 @@ sync_repo() {
     ahead|diverged) do_push || return ;;
     no-upstream) do_push -u || return ;;
   esac
-  RESULT=ok
-  keep_restore
+  # success: PRE == HEAD and SNAP_TAKEN=0 here, so restore runs only step 4 (keep) and the step 5 post-condition.
+  restore
+  [ -n "$RESULT" ] || RESULT=ok
 }
 
 process_repo() {

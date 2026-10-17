@@ -6,6 +6,7 @@ echo "----" >>"$STUB_CLAUDE_LOG"
 case " $* " in
   *" --tools "*)  # commit-message call
     [ "${STUB_MSG_MODE:-}" = fail ] && exit 1
+    [ "${STUB_MSG_MODE:-}" = sleep ] && { echo $$ >"$T/stub.pid"; touch "$STUB_MARKER"; exec sleep 600; }
     printf '%s\n' "${STUB_MSG:-stub: commit message}"
     exit 0 ;;
 esac
