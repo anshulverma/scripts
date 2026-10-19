@@ -23,6 +23,7 @@ case ${STUB_CLAUDE_MODE:-leave-markers} in
   resolve) each resolve1 ;;
   leave-markers) ;;
   exit-1) exit 1 ;;
+  stderr-no-nl) printf boom >&2; exit 1 ;;
   sleep) echo $$ >"$T/stub.pid"; touch "${STUB_MARKER:-$T/stub.marker}"; exec sleep "${STUB_SLEEP:-600}" ;;
   commit) each resolve1; git add -A && git commit -qm x ;;
   reset-hard) git reset -q --hard "origin/$(git symbolic-ref --short HEAD)" ;;

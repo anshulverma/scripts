@@ -62,6 +62,21 @@ For each repo it fetches, then: fast-forwards if behind, merges (`--no-ff`) if d
 
 Output is one tab-separated row per repo on stdout: `<repo>  <branch|->  <action>  <result>`. `action` is the steps that completed, joined by `+`, from `committed`, `merged`, `set-upstream`, `pushed` (or `none`). `result` is `ok`, `ok (<note>)`, `skipped:<reason>` or `failed:<reason>`. `--dry-run` fetches with `--no-prune`, changes nothing, prefixes the action with `would-`, and adds a fifth `state` column.
 
+### Report
+
+At exit, reposync writes a report to stderr and appends it to `${XDG_STATE_HOME:-~/.local/state}/reposync/report.log`, which is trimmed to its last 5000 lines. This happens on every run that gets past argument parsing, including a missing workspace, a held lock and an interrupt:
+
+```
+reposync 2026-10-19T09:17:02Z host=devbox workspace=/home/me/workspace dirty=skip
+dotfiles	main	pushed	ok
+WARN dotfiles: leftover reposync stash 4f2c…
+notes	main	none	failed:fetch
+  fatal: unable to access 'https://example.com/notes.git/': Could not resolve host: example.com
+summary: 2 repos: 1 ok, 0 skipped, 1 failed, 1 warnings; 38s; exit 1
+```
+
+The rows are the same as on stdout. A failed row is followed, indented, by the last 5 stderr lines (without `hint:` lines) of that repo's failed or interrupted fetch, merge, commit, push or claude calls. A run that stops early gets an `error: <reason>` line before the summary. `--dry-run` adds ` dry-run` to the header.
+
 ### Dirty modes
 
 | Mode             | Behaviour                                                                                   |
@@ -105,7 +120,7 @@ When a merge conflicts, reposync runs `claude -p --dangerously-skip-permissions`
 17 9 * * * mkdir -p <STATE_DIR> && XDG_STATE_HOME=<STATE_BASE> PATH=<P> ~/.local/bin/reposync > <STATE_DIR>/cron.log 2>&1 # reposync:managed
 ```
 
-That is daily at 09:17 with the default `--dirty=skip`. The log is `${XDG_STATE_HOME:-~/.local/state}/reposync/cron.log` and is overwritten on every run. `PATH` in the line holds the directories of `git`, `claude` and `node` found at install time, plus the usual system directories, since cron's own `PATH` is minimal. Re-running `install.sh` replaces the line.
+That is daily at 09:17 with the default `--dirty=skip`. To see what past cron runs did, read `report.log` (see [Report](#report)). `cron.log`, in the same directory, holds the full output of the last run only (it is overwritten every time). `PATH` in the line holds the directories of `git`, `claude` and `node` found at install time, plus the usual system directories, since cron's own `PATH` is minimal. Re-running `install.sh` replaces the line.
 
 ## Tests
 

@@ -15,12 +15,14 @@ if command -v timeout >/dev/null 2>&1; then TO=timeout
 elif command -v gtimeout >/dev/null 2>&1; then TO=gtimeout; fi
 CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 HAVE_LOCK=0 CHILD="" RC=0 FAILED=0 IN_REPO=0 FROM_SIGNAL=0
+# report (see write_report): counters, fatal error, and whether a report is written at exit
+N_OK=0 N_SKIP=0 N_FAIL=0 N_WARN=0 FATAL="" REPORT_ON=0 START=""
 # per-repo state (see reset_repo_state)
 REPO_DIR="" REPO_NAME="" B="" R="" PRE="" RS="" HAD_R=0 STATE="" SNAP="" SNAP_TAKEN=0 CLAUDE_MOVED=0
 SAVED_TREE="" STASH_SHA="" ADDED=0 U="" ACTIONS="" NOTE="" RESULT="" KSTATE="" KOLD=""
 TMPD=$(mktemp -d) || { echo "reposync: cannot create temp dir" >&2; exit 2; }
-OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err
-: >"$OUTF"; : >"$ERRF"; : >"$LASTERR"
+OUTF=$TMPD/out ERRF=$TMPD/err LASTERR=$TMPD/last.err REPORT=$TMPD/report
+: >"$OUTF"; : >"$ERRF"; : >"$LASTERR"; : >"$REPORT"
 
 usage() {
   cat <<'USAGE'
@@ -47,6 +49,8 @@ USAGE
 }
 
 die_usage() { echo "reposync: $1" >&2; usage >&2; exit 2; }
+# fatal CODE MSG: exit with MSG on stderr and in the report.
+fatal() { FATAL=$2; echo "reposync: $2" >&2; exit "$1"; }
 
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -76,23 +80,17 @@ resolve_workspace() {
     fi
     WS=${WORKSPACE_DIR:-$HOME/workspace}
   fi
-  [ -d "$WS" ] || { echo "reposync: workspace not found: $WS" >&2; exit 2; }
+  [ -d "$WS" ] || fatal 2 "workspace not found: $WS"
 }
 
 acquire_lock() {
   local pid
-  mkdir -p "$STATE_DIR" || { echo "reposync: cannot create $STATE_DIR" >&2; exit 2; }
+  mkdir -p "$STATE_DIR" || fatal 2 "cannot create $STATE_DIR"
   if ! mkdir "$STATE_DIR/lock" 2>/dev/null; then
     pid=$(cat "$STATE_DIR/lock/pid" 2>/dev/null || true)
-    if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then
-      echo "reposync: another run (pid ${pid:-?}) holds the lock" >&2
-      exit 3
-    fi
+    if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then fatal 3 "another run (pid ${pid:-?}) holds the lock"; fi
     rm -rf "$STATE_DIR/lock"
-    if ! mkdir "$STATE_DIR/lock" 2>/dev/null; then
-      echo "reposync: another run (pid ?) holds the lock" >&2
-      exit 3
-    fi
+    mkdir "$STATE_DIR/lock" 2>/dev/null || fatal 3 "another run (pid ?) holds the lock"
   fi
   echo $$ >"$STATE_DIR/lock/pid"
   HAVE_LOCK=1
@@ -100,7 +98,7 @@ acquire_lock() {
 
 release_lock() { [ "$HAVE_LOCK" = 1 ] && rm -rf "$STATE_DIR/lock"; HAVE_LOCK=0; }
 
-# run_child INFILE CMD...: background + wait so traps fire promptly; sets RC.
+# run_child INFILE CMD...: background + wait so traps fire promptly; sets RC. A failed child's stderr goes to ERRF.
 run_child() {
   local infile=$1
   shift
@@ -109,7 +107,7 @@ run_child() {
   wait "$CHILD"
   RC=$?
   CHILD=""
-  cat "$LASTERR" >>"$ERRF"
+  [ "$RC" = 0 ] || cat "$LASTERR" >>"$ERRF"
   cat "$LASTERR" >&2
 }
 
@@ -135,16 +133,25 @@ add_action() {
 }
 
 # emit_row RESULT: one row per repo; dry-run prefixes the action with would- and adds the state column.
+# The row also goes to the report, followed for a failure by the last stderr lines of this repo's git/claude calls.
 emit_row() {
-  local act=${ACTIONS:-none} st=$STATE
-  case $1 in failed:*) FAILED=1 ;; esac
+  local act=${ACTIONS:-none} st=$STATE line
+  case $1 in
+    failed:*) FAILED=1 N_FAIL=$((N_FAIL + 1)) ;;
+    skipped:*) N_SKIP=$((N_SKIP + 1)) ;;
+    *) N_OK=$((N_OK + 1)) ;;
+  esac
   if [ "$DRY_RUN" = 1 ]; then
     [ -n "$ACTIONS" ] && act=would-$ACTIONS
     case $1 in skipped:dirty) st=dirty ;; skipped:*|failed:*) st=$1 ;; esac
-    printf '%s\t%s\t%s\t%s\t%s\n' "$REPO_NAME" "${B:--}" "$act" "$1" "$st"
+    printf -v line '%s\t%s\t%s\t%s\t%s' "$REPO_NAME" "${B:--}" "$act" "$1" "$st"
   else
-    printf '%s\t%s\t%s\t%s\n' "$REPO_NAME" "${B:--}" "$act" "$1"
+    printf -v line '%s\t%s\t%s\t%s' "$REPO_NAME" "${B:--}" "$act" "$1"
   fi
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >>"$REPORT"
+  # awk ends every line with a newline (a child may not); hint lines would crowd out push's error lines
+  case $1 in failed:*) awk '!/^hint: / { print "  " $0 }' "$ERRF" | tail -n 5 >>"$REPORT" ;; esac
 }
 
 is_repo() {
@@ -707,8 +714,8 @@ leftover_warnings() {
   local line re='^On [^:]*: reposync-keep '
   while IFS= read -r line; do
     [[ ${line#* } =~ $re ]] || continue
-    echo "WARN $REPO_NAME: leftover reposync stash ${line%% *}"
-    FAILED=1
+    echo "WARN $REPO_NAME: leftover reposync stash ${line%% *}" | tee -a "$REPORT"
+    FAILED=1 N_WARN=$((N_WARN + 1))
   done <<EOL
 $(g stash list --format='%H %s' 2>/dev/null)
 EOL
@@ -768,6 +775,7 @@ sync_repo() {
 process_repo() {
   reset_repo_state
   REPO_DIR=$1 REPO_NAME=${1##*/}
+  : >"$ERRF"
   if ! is_repo; then emit_row skipped:not-git; return; fi
   IN_REPO=1
   sync_repo
@@ -779,7 +787,7 @@ process_repo() {
 # on_signal CODE: §9. Stop the child, restore the in-progress repo (never calls claude), report, exit CODE.
 on_signal() {
   trap '' INT TERM HUP
-  if [ -n "$CHILD" ]; then kill -TERM "$CHILD" 2>/dev/null; wait "$CHILD"; CHILD=""; fi
+  if [ -n "$CHILD" ]; then kill -TERM "$CHILD" 2>/dev/null; wait "$CHILD"; CHILD=""; cat "$LASTERR" >>"$ERRF"; fi
   FROM_SIGNAL=1
   if [ "$IN_REPO" = 1 ]; then
     RESULT=failed:interrupted
@@ -789,12 +797,45 @@ on_signal() {
   exit "$1"
 }
 
-trap 'release_lock; rm -rf "$TMPD"' EXIT
+# ponytail: report.log keeps its last 5000 lines (the oldest block may be cut); rotate files if history matters.
+REPORT_MAX=5000
+
+# write_report RC: header, rows, summary to stderr and appended to $STATE_DIR/report.log (what the cron run did).
+write_report() {
+  local f=$TMPD/report.full log=$STATE_DIR/report.log dr=""
+  [ "$DRY_RUN" = 1 ] && dr=" dry-run"
+  {
+    echo "reposync $START host=$HOSTNAME workspace=$WS dirty=$DIRTY_MODE$dr"
+    cat "$REPORT"
+    [ -n "$FATAL" ] && echo "error: $FATAL"
+    echo "summary: $((N_OK + N_SKIP + N_FAIL)) repos: $N_OK ok, $N_SKIP skipped, $N_FAIL failed, $N_WARN warnings;" \
+      "${SECONDS}s; exit $1"
+  } >"$f"
+  # the log first: stderr may be a closed pipe
+  if mkdir -p "$STATE_DIR" 2>/dev/null && { cat "$f"; echo; } >>"$log" 2>/dev/null; then
+    # trim only under the lock. ponytail: a lock-refused run appending during the tail+mv loses its block (ms window).
+    if [ "$HAVE_LOCK" = 1 ] && [ "$(wc -l <"$log")" -gt "$REPORT_MAX" ]; then
+      tail -n "$REPORT_MAX" "$log" >"$log.tmp" && mv "$log.tmp" "$log"
+    fi
+  fi
+  { echo; cat "$f"; } >&2 2>/dev/null
+}
+
+on_exit() {
+  # a signal (or SIGPIPE on stderr) now would cut the report short and leave the lock and TMPD behind
+  trap '' INT TERM HUP PIPE
+  [ "$REPORT_ON" = 1 ] && write_report "$1"
+  release_lock
+  rm -rf "$TMPD"
+}
+
+trap 'on_exit $?' EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM HUP
 
 main() {
   parse_args "$@"
+  START=$(date -u +%Y-%m-%dT%H:%M:%SZ) SECONDS=0 REPORT_ON=1
   resolve_workspace
   acquire_lock
   local d
